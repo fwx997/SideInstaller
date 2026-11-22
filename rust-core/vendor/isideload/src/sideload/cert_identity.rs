@@ -475,16 +475,17 @@ mod certificate_reuse_tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_lookup_error_never_falls_through_to_certificate_creation() {
+    #[test]
+    fn a_lookup_error_never_falls_through_to_certificate_creation() {
         let storage = InMemoryStorage::new();
         let email = "certificate-reuse@example.invalid";
         let folder = hex::encode(Sha256::digest(email.as_bytes()));
         let key = include_bytes!("../../../../testdata/p12/key.pk8");
         storage.store_data(&format!("{folder}/key"), key).unwrap();
         let team = DeveloperTeam { name: None, team_id: "TESTTEAM01".into(), r#type: None, status: None };
-        let error = CertificateIdentity::retrieve("test", email, &mut FailedPortal, &team, &storage,
-            &MaxCertsBehavior::Error).await.err().expect("lookup failure should stop signing");
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(CertificateIdentity::retrieve("test", email, &mut FailedPortal,
+            &team, &storage, &MaxCertsBehavior::Error)).err().expect("lookup failure should stop signing");
         assert!(format!("{error:?}").contains("simulated portal connection failure"));
         assert_eq!(storage.retrieve_data(&format!("{folder}/key")).unwrap().unwrap(), key);
     }

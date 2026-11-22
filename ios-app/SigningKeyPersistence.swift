@@ -87,7 +87,7 @@ private enum DeviceSigningKeys {
 func signingKeySync(_ storage: UnsafePointer<CChar>?, _ key: UnsafePointer<CChar>?, _ mode: Int32) -> Int32 {
     guard let storage, let key else { return errSecParam }
     let root = URL(fileURLWithPath: String(cString: storage)).standardizedFileURL
-    guard root == PrivateStore.isideload.standardizedFileURL else { return errSecSuccess }
+    guard root.path == PrivateStore.isideload.standardizedFileURL.path else { return errSecSuccess }
     DeviceSigningKeys.lock.lock()
     defer { DeviceSigningKeys.lock.unlock() }
     let store = SigningKeyPersistence(root: root,
