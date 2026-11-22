@@ -16,7 +16,7 @@
 #
 # Config, all overridable by env:
 #   VERSION        CFBundleShortVersionString, e.g. 1.6.0 (default: project.yml's)
-#   BUILD_NUMBER   CFBundleVersion (default: project.yml's)
+#   BUILD_NUMBER   CFBundleVersion (default: this personal build's number)
 #   BUNDLE_ID      bundle id of the app; the extension keeps its suffix, e.g.
 #                  .LiveActivity (default: com.frizzlem.sideinstaller, the
 #                  published one)
@@ -39,7 +39,7 @@ OUTPUT="${OUTPUT:-$ROOT/build/SideInstaller.ipa}"
 DERIVED_DATA="${DERIVED_DATA:-$ROOT/build/DerivedData}"
 REBUILD_RUST="${REBUILD_RUST:-0}"
 VERSION="${VERSION:-}"
-BUILD_NUMBER="${BUILD_NUMBER:-}"
+BUILD_NUMBER="${BUILD_NUMBER:-20261122.1}"
 MIN_IOS_SDK="${MIN_IOS_SDK:-27.1}"
 
 die() { echo "error: $*" >&2; exit 1; }

@@ -6,7 +6,7 @@ OUTPUT="$1"
 BUILD_ROOT="${RUNNER_TEMP:-$ROOT/build}/siboot-cross"
 mkdir -p "$BUILD_ROOT/CertificateReuseBuild"
 python3 -m venv "$BUILD_ROOT/venv"
-"$BUILD_ROOT/venv/bin/python" -m pip install --disable-pip-version-check 'cargo-zigbuild==0.20.4' 'ziglang==0.13.0'
+"$BUILD_ROOT/venv/bin/python" -m pip install --disable-pip-version-check 'cargo-zigbuild==0.24.1' 'ziglang==0.13.0'
 export PATH="$BUILD_ROOT/venv/bin:$PATH"
 rustup target add aarch64-unknown-linux-musl
 export CARGO_TARGET_DIR="$ROOT/bootstrap/target"

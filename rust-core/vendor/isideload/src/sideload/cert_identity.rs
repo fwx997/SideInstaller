@@ -170,16 +170,15 @@ impl CertificateIdentity {
     ) -> Result<Option<Self>, Report> {
         let pr = Self::retrieve_private_key(apple_email, storage).await?;
 
-        match Self::find_matching(&pr, developer_session, team).await {
-            Ok(Some((cert, x509_cert))) => Ok(Some(Self {
+        let found = Self::find_matching(&pr, developer_session, team)
+            .await
+            .context("Couldn't check the existing signing certificate")?;
+        Ok(found.map(|(cert, x509_cert)| Self {
                 machine_id: cert.machine_id.clone().unwrap_or_default(),
                 machine_name: cert.machine_name.clone().unwrap_or_default(),
                 certificate: x509_cert,
                 private_key: pr,
-            })),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e).context("Couldn't check the existing signing certificate"),
-        }
+            }))
     }
 
     /// The certificates that sit between this identity's certificate and
