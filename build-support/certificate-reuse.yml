@@ -1,0 +1,119 @@
+name: Build certificate reuse fixes
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: certificate-reuse-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bootstrap/target
+          key: reuse-linux-${{ hashFiles('bootstrap/Cargo.lock') }}
+      - name: Build tools
+        run: sudo apt-get update -qq && sudo apt-get install -y musl-tools cmake clang perl pkg-config
+      - name: Bootstrap tests
+        run: cargo test --manifest-path bootstrap/Cargo.toml --locked
+      - name: Build static Open Minis binary
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=static"
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --manifest-path bootstrap/Cargo.toml --release --locked --target aarch64-unknown-linux-musl
+      - name: Verify and collect
+        run: |
+          set -eu
+          mkdir -p artifacts
+          cp bootstrap/target/aarch64-unknown-linux-musl/release/siboot artifacts/siboot-aarch64
+          file artifacts/siboot-aarch64
+          if readelf -l artifacts/siboot-aarch64 | grep -q INTERP; then exit 1; fi
+          artifacts/siboot-aarch64 --version
+          artifacts/siboot-aarch64 --help
+          sha256sum artifacts/siboot-aarch64 > artifacts/SHA256SUMS
+          git rev-parse HEAD > artifacts/source-commit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: siboot-certificate-reuse
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  ios:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select Xcode and tools
+        run: |
+          set -eu
+          if [ -d /Applications/Xcode_27.1.app ]; then
+            echo 'DEVELOPER_DIR=/Applications/Xcode_27.1.app/Contents/Developer' >> "$GITHUB_ENV"
+          else
+            echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+          fi
+          command -v xcodegen >/dev/null || brew install xcodegen
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: reuse-ios-${{ hashFiles('rust-core/Cargo.lock') }}
+      - name: Rust regression tests
+        env:
+          LOCKED: "1"
+        run: bash scripts/test-rust.sh
+      - name: Simulator and Swift tests
+        env:
+          DERIVED_DATA: ${{ runner.temp }}/DerivedData-sim
+          RESULT_BUNDLE: ${{ runner.temp }}/CertificateReuseTests.xcresult
+        run: bash scripts/check-ios.sh
+      - name: Build fixed IPA
+        env:
+          VERSION: "2.1.1"
+          BUILD_NUMBER: "20261122.1"
+          OUTPUT: ${{ github.workspace }}/artifacts/SideInstaller.ipa
+          DERIVED_DATA: ${{ runner.temp }}/DerivedData-device
+          REBUILD_RUST: "1"
+        run: bash scripts/build-ipa.sh
+      - name: Collect receipt
+        run: |
+          shasum -a 256 artifacts/SideInstaller.ipa > artifacts/SHA256SUMS
+          git rev-parse HEAD > artifacts/source-commit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SideInstaller-certificate-reuse
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: CertificateReuseTests-xcresult
+          path: ${{ runner.temp }}/CertificateReuseTests.xcresult
+          if-no-files-found: ignore
+          retention-days: 7

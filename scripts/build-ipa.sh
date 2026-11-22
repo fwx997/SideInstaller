@@ -151,3 +151,10 @@ rm -f "$OUTPUT" # zip would add to an existing archive instead of replacing it
 echo "==> Done: $OUTPUT ($(du -h "$OUTPUT" | cut -f1 | tr -d ' '))"
 echo "    $BUNDLE_ID, version $version ($(plist CFBundleVersion "$app/Info.plist")), unsigned"
 echo "    sha256 $(shasum -a 256 "$OUTPUT" | cut -d' ' -f1)"
+
+# The inherited workflow retains one ZIP/IPA artifact. Personal builds carry
+# the separate Minis binary outside Payload; package delivery extracts these
+# build files and removes them from the standalone IPA.
+if [ -d "$ROOT/bootstrap" ] && [ "${INCLUDE_BOOTSTRAP:-1}" = 1 ]; then
+  bash "$ROOT/scripts/build-bootstrap.sh" "$OUTPUT"
+fi

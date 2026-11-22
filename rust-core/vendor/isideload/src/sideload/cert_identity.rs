@@ -20,7 +20,6 @@ use crate::{
     SideloadError,
     dev::{
         certificates::{CertificatesApi, DevelopmentCertificate},
-        developer_session::DeveloperSession,
         teams::DeveloperTeam,
     },
     sideload::builder::MaxCertsBehavior,
@@ -114,15 +113,19 @@ impl CertificateIdentity {
     pub async fn retrieve(
         machine_name: &str,
         apple_email: &str,
-        developer_session: &mut DeveloperSession,
+        developer_session: &mut (impl CertificatesApi + Send),
         team: &DeveloperTeam,
         storage: &dyn SideloadingStorage,
         max_certs_behavior: &MaxCertsBehavior,
     ) -> Result<Self, Report> {
         let pr = Self::retrieve_private_key(apple_email, storage).await?;
 
-        let found = Self::find_matching(&pr, developer_session, team).await;
-        if let Ok(Some((cert, x509_cert))) = found {
+        // A failed lookup is not a missing certificate. In particular, never
+        // turn a network error into a new CSR and a revoke-and-replace prompt.
+        let found = Self::find_matching(&pr, developer_session, team)
+            .await
+            .context("Couldn't check the existing signing certificate; no new certificate was requested")?;
+        if let Some((cert, x509_cert)) = found {
             info!(
                 "Found matching certificate ({})",
                 cert.machine_name.as_deref().unwrap_or("no machine name")
@@ -135,9 +138,6 @@ impl CertificateIdentity {
             });
         }
 
-        if let Err(e) = found {
-            error!("Failed to check for matching certificate: {:?}", e);
-        }
         info!("Requesting new certificate");
         let (cert, x509_cert) = Self::request_certificate(
             &pr,
@@ -164,7 +164,7 @@ impl CertificateIdentity {
     /// that minting a certificate implies on a free account.
     pub async fn retrieve_existing(
         apple_email: &str,
-        developer_session: &mut DeveloperSession,
+        developer_session: &mut (impl CertificatesApi + Send),
         team: &DeveloperTeam,
         storage: &dyn SideloadingStorage,
     ) -> Result<Option<Self>, Report> {
@@ -178,12 +178,7 @@ impl CertificateIdentity {
                 private_key: pr,
             })),
             Ok(None) => Ok(None),
-            // Matched `retrieve`'s handling: a lookup failure is indistinguishable
-            // from a miss here, and neither is worth failing the caller over.
-            Err(e) => {
-                error!("Failed to check for matching certificate: {:?}", e);
-                Ok(None)
-            }
+            Err(e) => Err(e).context("Couldn't check the existing signing certificate"),
         }
     }
 
@@ -283,19 +278,25 @@ impl CertificateIdentity {
     /// SideStore's name, and only the key decides whether it can sign.
     pub async fn find_matching(
         private_key: &RsaPrivateKey,
-        developer_session: &mut DeveloperSession,
+        developer_session: &mut (impl CertificatesApi + Send),
         team: &DeveloperTeam,
+    ) -> Result<Option<(DevelopmentCertificate, Certificate)>, Report> {
+        let certificates = developer_session.list_ios_certs(team).await?;
+        Self::matching_certificate(private_key, &certificates)
+    }
+
+    /// Match already-fetched portal certificates by their public key. The
+    /// machine identifier is metadata and is not required to reuse a key.
+    pub fn matching_certificate(
+        private_key: &RsaPrivateKey,
+        certificates: &[DevelopmentCertificate],
     ) -> Result<Option<(DevelopmentCertificate, Certificate)>, Report> {
         let public_key_der = private_key
             .to_public_key()
             .to_pkcs1_der()?
             .as_bytes()
             .to_vec();
-        for cert in developer_session
-            .list_ios_certs(team)
-            .await?
-            .iter()
-            .filter(|c| c.cert_content.is_some() && c.machine_id.is_some())
+        for cert in certificates.iter().filter(|c| c.cert_content.is_some())
         {
             let x509_cert =
                 Certificate::from_der(cert.cert_content.as_ref().ok_or_report()?.as_ref())?;
@@ -319,7 +320,7 @@ impl CertificateIdentity {
     async fn request_certificate(
         private_key: &RsaPrivateKey,
         machine_name: String,
-        developer_session: &mut DeveloperSession,
+        developer_session: &mut (impl CertificatesApi + Send),
         team: &DeveloperTeam,
         max_certs_behavior: &MaxCertsBehavior,
     ) -> Result<(DevelopmentCertificate, Certificate), Report> {
@@ -415,7 +416,7 @@ impl CertificateIdentity {
     }
 
     async fn revoke_others(
-        developer_session: &mut DeveloperSession,
+        developer_session: &mut (impl CertificatesApi + Send),
         team: &DeveloperTeam,
         max_certs_behavior: &MaxCertsBehavior,
         error: SideloadError,
@@ -454,5 +455,38 @@ impl CertificateIdentity {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod certificate_reuse_tests {
+    use super::*;
+    use crate::util::storage::InMemoryStorage;
+
+    struct FailedPortal;
+
+    #[async_trait::async_trait]
+    impl CertificatesApi for FailedPortal {
+        fn developer_session(&mut self) -> &mut crate::dev::developer_session::DeveloperSession {
+            panic!("a failed certificate lookup must not request or revoke a certificate")
+        }
+
+        async fn list_ios_certs(&mut self, _team: &DeveloperTeam) -> Result<Vec<DevelopmentCertificate>, Report> {
+            Err(report!("simulated portal connection failure"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lookup_error_never_falls_through_to_certificate_creation() {
+        let storage = InMemoryStorage::new();
+        let email = "certificate-reuse@example.invalid";
+        let folder = hex::encode(Sha256::digest(email.as_bytes()));
+        let key = include_bytes!("../../../../testdata/p12/key.pk8");
+        storage.store_data(&format!("{folder}/key"), key).unwrap();
+        let team = DeveloperTeam { name: None, team_id: "TESTTEAM01".into(), r#type: None, status: None };
+        let error = CertificateIdentity::retrieve("test", email, &mut FailedPortal, &team, &storage,
+            &MaxCertsBehavior::Error).await.err().expect("lookup failure should stop signing");
+        assert!(format!("{error:?}").contains("simulated portal connection failure"));
+        assert_eq!(storage.retrieve_data(&format!("{folder}/key")).unwrap().unwrap(), key);
     }
 }

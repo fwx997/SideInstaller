@@ -89,4 +89,8 @@ for crate in "${VENDORED[@]}"; do
   (cd "$dir" && cargo test --lib --no-default-features ${list:+--features "$list"} \
     ${patches[@]+"${patches[@]}"} -- ${skips[@]+"${skips[@]}"})
 done
+if [ -d "$ROOT/bootstrap" ]; then
+  echo "==> siboot certificate reuse and bootstrap regressions"
+  cargo test --manifest-path "$ROOT/bootstrap/Cargo.toml" --locked
+fi
 echo "==> All Rust tests passed"

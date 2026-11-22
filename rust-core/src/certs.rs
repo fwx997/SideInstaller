@@ -469,13 +469,15 @@ pub unsafe fn cert_export(
 /// has made none yet. Read as is: `CertificateIdentity::retrieve_private_key`
 /// would make one.
 fn signing_key(session: &CertSession) -> Result<Option<RsaPrivateKey>, String> {
+    use isideload::util::{fs_storage::FsStorage, storage::SideloadingStorage};
     let path = apple_session::account_dir(&session.storage_dir, &session.apple_id).join("key");
-    match std::fs::read(&path) {
-        Ok(der) => RsaPrivateKey::from_pkcs8_der(&der)
+    let relative = path.strip_prefix(&session.storage_dir).map_err(|e| e.to_string())?;
+    match FsStorage::new(session.storage_dir.clone()).retrieve_data(&relative.to_string_lossy()) {
+        Ok(Some(der)) => RsaPrivateKey::from_pkcs8_der(&der)
             .map(Some)
             .map_err(|e| format!("couldn't read the signing key: {e}")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("couldn't read the signing key: {e}")),
+        Ok(None) => Ok(None),
+        Err(e) => Err(report_text(&e)),
     }
 }
 
@@ -504,6 +506,11 @@ fn store_signing_key(storage_dir: &Path, apple_id: &str, key: &RsaPrivateKey) ->
             let same = RsaPrivateKey::from_pkcs8_der(&current)
                 .is_ok_and(|k| k.to_public_key() == key.to_public_key());
             if same {
+                // Populate the reinstall backup even for a no-op import.
+                use isideload::util::{fs_storage::FsStorage, storage::SideloadingStorage};
+                let relative = path.strip_prefix(storage_dir).map_err(|e| e.to_string())?;
+                FsStorage::new(storage_dir.to_path_buf()).retrieve_data(&relative.to_string_lossy())
+                    .map_err(|e| report_text(&e))?;
                 return Ok(false);
             }
             let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -521,6 +528,13 @@ fn store_signing_key(storage_dir: &Path, apple_id: &str, key: &RsaPrivateKey) ->
     let tmp = dir.join("key.tmp");
     std::fs::write(&tmp, der.as_bytes()).map_err(|e| format!("couldn't write the key: {e}"))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("couldn't write the key: {e}"))?;
+    // An imported key must survive reinstalling the app just like a key
+    // created by isideload. FsStorage performs the native Keychain backup.
+    use isideload::util::{fs_storage::FsStorage, storage::SideloadingStorage};
+    let relative = path.strip_prefix(storage_dir).map_err(|e| e.to_string())?;
+    FsStorage::new(storage_dir.to_path_buf())
+        .retrieve_data(&relative.to_string_lossy())
+        .map_err(|e| report_text(&e))?;
     Ok(true)
 }
 
