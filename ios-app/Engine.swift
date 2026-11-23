@@ -2125,6 +2125,12 @@ final class Engine {
     /// ID, not the second.
     private func performSign(session: OpaquePointer, ipa: String, udid: String, deviceName: String,
                              pairingFilePath: String, forMadeira: Bool) throws -> String {
+        if let host = try Self.protectedCompanionIdentifier() {
+            guard let info = IPALibrary.appInfo(at: URL(fileURLWithPath: ipa)) else {
+                throw CompanionInstallPolicy.Failure.unreadableIdentity
+            }
+            try CompanionInstallPolicy.validateTarget(info.bundleID, signingTeam: signingTeamID, hostIdentifier: host)
+        }
         log("Signing \(ipa) …")
         if forMadeira {
             log("Signing for Madeira: Increased Memory Limit on its App ID (it shows as Memory+), and no app group.")
@@ -2137,6 +2143,12 @@ final class Engine {
         if rc == 0 {
             let path = signed.map { String(cString: $0) } ?? ""
             signed.map { si_string_free($0) }
+            do {
+                try Self.validateCompanionInstall(at: path)
+            } catch {
+                Self.discardSignedBundle(at: path)
+                throw error
+            }
             log("Signed bundle at \(path)")
             return path
         } else {
@@ -2153,6 +2165,19 @@ final class Engine {
             }
             throw EngineError.message(L("Signing failed: %@", msg))
         }
+    }
+
+    private static func protectedCompanionIdentifier() throws -> String? {
+        guard isBuiltInCompanion else { return nil }
+        guard let identifier = companionHostBundle?.bundleIdentifier, !identifier.isEmpty else {
+            throw CompanionInstallPolicy.Failure.unreadableIdentity
+        }
+        return identifier
+    }
+
+    private static func validateCompanionInstall(at path: String) throws {
+        guard let host = try protectedCompanionIdentifier() else { return }
+        try CompanionInstallPolicy.validateSignedBundle(at: path, hostIdentifier: host)
     }
 
     /// True when the IPA at `ipaPath` is Madeira, whichever way it got here: the
@@ -2221,6 +2246,7 @@ final class Engine {
     @MainActor
     private func install(prestaged: DeviceConnection.PrestagedBundle? = nil) async throws {
         guard let bundle = signedAppPath else { throw EngineError.message(L("No signed bundle to install.")) }
+        try Self.validateCompanionInstall(at: bundle)
         setStep(.install, .active)
         installProgress = 0
         let ip = deviceHost
@@ -3626,6 +3652,7 @@ final class Engine {
             throw EngineError.message(L("Apple won't issue a signing certificate for this Apple ID: it reports that one already exists (error 7460). Under Tools › Certificates, use SideStore's certificate or revoke that one, then refresh again."))
         }
         defer { Self.discardSignedBundle(at: signed) }
+        try Self.validateCompanionInstall(at: signed)
         installProgress = 0
         let ip = deviceHost
         try await onDeviceQueue {
