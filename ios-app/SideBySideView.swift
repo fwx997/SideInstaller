@@ -535,6 +535,8 @@ final class SideBySideManager: ObservableObject {
 
         task = Task { @MainActor in
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 await ensureLocalNetwork()
                 let address = try await connectToTarget(app: app)
                 if let setsUp { try checkCompatibility(of: setsUp) }

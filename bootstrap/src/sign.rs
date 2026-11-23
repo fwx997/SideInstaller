@@ -20,6 +20,7 @@ pub struct Signed {
     /// The signed `.app` folder, ready to upload.
     pub app_dir: PathBuf,
     pub bundle_id: String,
+    pub companion: Option<crate::companion::Layout>,
     pub name: String,
     /// `CFBundleShortVersionString`, when it has one.
     pub version: Option<String>,
@@ -148,10 +149,18 @@ pub async fn sign(session: &mut Session, ipa: &Path, device: &DeviceInfo) -> Res
             Fail::new(sign_advice(&text), text)
         })?;
     let (bundle_id, name, version) = bundle_info(&app_dir)?;
+    let mut companion = crate::companion::Layout::inspect(&app_dir)?;
+    if let Some(layout) = companion.as_mut() {
+        layout.certificate = session.sideloader.take_last_signed_identity();
+        if layout.certificate.is_none() {
+            return Err(Fail::new("The signed companion package has no certificate handoff.", "missing signing identity"));
+        }
+    }
     ui::ok(&format!("signed {name} as {bundle_id}"));
     Ok(Signed {
         app_dir,
         bundle_id,
+        companion,
         name,
         version,
     })

@@ -201,7 +201,9 @@ final class Engine {
     static let verboseLoggingKey = "verboseLogging"
 
     // The loopback VPN's device-side IP; configurable in Advanced.
-    var deviceIP: String = Engine.defaultDeviceIP
+    var deviceIP: String = UserDefaults.standard.string(forKey: "deviceIP") ?? Engine.defaultDeviceIP {
+        didSet { UserDefaults.standard.set(deviceIP, forKey: "deviceIP") }
+    }
     /// Device IP's default: LocalDevVPN's far end of the tunnel.
     static let defaultDeviceIP = "10.7.0.1"
     /// `deviceIP` normalized to a dialable host, e.g. `10.7.0.1/32` → `10.7.0.1`.
@@ -316,6 +318,27 @@ final class Engine {
     /// True when SideInstaller runs as a LiveContainer guest. iOS then applies
     /// LiveContainer's Info.plist to the process, not SideInstaller's.
     static var runsInLiveContainer: Bool { getenv("LC_HOME_PATH") != nil }
+
+    /// The bundled companion is updated together with its host by SideStore.
+    static var isBuiltInCompanion: Bool {
+        runsInLiveContainer && Bundle.main.bundleURL.lastPathComponent == "SideInstallerApp.framework"
+            && NSClassFromString("LCCompanionBridge") != nil
+    }
+
+    static var companionHostBundle: Bundle? {
+        isBuiltInCompanion ? liveContainerBundle() : nil
+    }
+
+    @MainActor
+    @discardableResult
+    func openCompanionUpdates() -> Bool {
+        guard Self.isBuiltInCompanion, let bridge = NSClassFromString("LCCompanionBridge") else { return false }
+        let selector = NSSelectorFromString("openApp:")
+        guard let method = class_getClassMethod(bridge, selector) else { return false }
+        typealias Open = @convention(c) (AnyClass, Selector, NSString) -> Bool
+        let open = unsafeBitCast(method_getImplementation(method), to: Open.self)
+        return open(bridge, selector, "builtinSideStore")
+    }
 
     /// False from iOS 26.4 on, where lockdownd hangs up on a connection that
     /// reaches it through a loopback VPN, on its first request. A lockdown pair
@@ -722,8 +745,11 @@ final class Engine {
         InstallActivity.shared.runStarted()
 
         pipelineTask = Task { @MainActor in
+            var companionLease: CompanionOperationLease.Token?
+            defer { companionLease?.release() }
             var outcome = InstallActivity.Outcome.cancelled
             do {
+                companionLease = try CompanionOperationLease.acquire()
                 try await ensureNetwork()
                 // The download needs neither the device nor the Apple ID, so it
                 // starts now and runs while those steps do.
@@ -2941,6 +2967,8 @@ final class Engine {
                 return
             }
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 let apps = try self.connection.listApps()
                 self.log("installation_proxy reachable — \(apps.count) apps:")
                 for a in apps.prefix(200) { self.log("  \(a)") }
@@ -3160,6 +3188,10 @@ final class Engine {
     /// and the update banner.
     @MainActor
     func installLinkedIPA(_ url: URL) {
+        if Self.isBuiltInCompanion && url.absoluteString == UpdateChecker.releaseIPAURL {
+            openCompanionUpdates()
+            return
+        }
         guard !isRunning, !isImportingIPA else { return }
         lastError = nil
         installSource = .custom
@@ -3259,6 +3291,10 @@ final class Engine {
     /// replacing an app with the same bundle ID.
     @MainActor
     func installInLiveContainer(_ ipa: URL) {
+        if Self.isBuiltInCompanion && ipa.absoluteString == UpdateChecker.releaseIPAURL {
+            openCompanionUpdates()
+            return
+        }
         // LiveContainer takes the link percent-decoded, so all of it is encoded.
         let link = ipa.absoluteString.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
         guard let url = URL(string: "livecontainer://install?url=\(link)") else { return }
@@ -3667,8 +3703,8 @@ final class Engine {
     func stopSimulatingLocation() async throws {
         guard connection.isSimulatingLocation else { return }
         try await onDeviceQueue {
+            defer { self.connection.endLocationSimulation() }
             try self.connection.clearSimulatedLocation()
-            self.connection.endLocationSimulation()
         }
         log("Simulated location cleared.")
     }
@@ -3680,6 +3716,8 @@ final class Engine {
     /// device link first.
     @MainActor
     func deviceCrashLogs() async throws -> [DeviceCrashLog] {
+        let companionLease = try CompanionOperationLease.acquire()
+        defer { companionLease.release() }
         guard !isRunning else {
             throw EngineError.message(L("An install is already running. Wait for it to finish, then try again."))
         }
@@ -3715,6 +3753,8 @@ final class Engine {
     /// itself), a classic pair record still reaches AMFI through lockdownd.
     @MainActor
     func requestDeveloperMode(_ request: DeviceConnection.DeveloperModeRequest) async throws -> DeveloperModeOutcome {
+        let companionLease = try CompanionOperationLease.acquire()
+        defer { companionLease.release() }
         guard !isRunning else {
             throw EngineError.message(L("An install is already running. Wait for it to finish, then try again."))
         }
@@ -4037,7 +4077,9 @@ final class Engine {
 
     /// Bridge a blocking deviceQueue body to async.
     private func onDeviceQueue<T>(_ work: @escaping () throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { cont in
+        let companionLease = try CompanionOperationLease.acquire()
+        defer { companionLease.release() }
+        return try await withCheckedThrowingContinuation { cont in
             deviceQueue.async {
                 do { cont.resume(returning: try work()) }
                 catch { cont.resume(throwing: error) }
@@ -4047,7 +4089,9 @@ final class Engine {
 
     /// Bridge a blocking signQueue body to async.
     private func onSignQueue<T>(_ work: @escaping () throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { cont in
+        let companionLease = try CompanionOperationLease.acquire()
+        defer { companionLease.release() }
+        return try await withCheckedThrowingContinuation { cont in
             signQueue.async {
                 do { cont.resume(returning: try work()) }
                 catch { cont.resume(throwing: error) }

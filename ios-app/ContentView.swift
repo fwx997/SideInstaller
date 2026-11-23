@@ -32,6 +32,9 @@ struct ContentView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     header.cascadeItem(0)
+                    if Engine.isBuiltInCompanion {
+                        companionUpdateButton
+                    }
                     if updateChecker.showBanner {
                         updateBanner.transition(.cardAppear)
                     }
@@ -248,6 +251,25 @@ struct ContentView: View {
     /// with LiveContainer on this iPhone, the release installed inside it.
     @ViewBuilder
     private var updateOptions: some View {
+        if Engine.isBuiltInCompanion {
+            companionUpdateButton
+        } else {
+            standaloneUpdateOptions
+        }
+    }
+
+    private var companionUpdateButton: some View {
+        Button {
+            engine.openCompanionUpdates()
+        } label: {
+            Label("在 SideStore 中更新组合包", systemImage: "arrow.triangle.2.circlepath")
+                .font(.footnote)
+        }
+        .disabled(engine.isRunning || engine.isImportingIPA)
+    }
+
+    @ViewBuilder
+    private var standaloneUpdateOptions: some View {
         Button {
             if let url = URL(string: UpdateChecker.installPageURL) { openURL(url) }
         } label: {

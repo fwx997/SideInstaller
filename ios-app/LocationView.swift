@@ -368,6 +368,7 @@ struct RouteProgress: Equatable {
 /// UI state lives here — the shared `Engine` owns the device connection.
 @MainActor
 final class LocationManager: ObservableObject {
+    private var companionLease: CompanionOperationLease.Token?
 
     /// Setup progress (not shown in the UI). Resets to `.notReady` on any
     /// session error, since re-pairing tears down the device link.
@@ -466,7 +467,11 @@ final class LocationManager: ObservableObject {
         guard stage != .ready, !isBusy else { return }
         isBusy = true
         Task {
-            do { try await ensureReady(quietly: true) }
+            do {
+                let lease = try CompanionOperationLease.acquire()
+                defer { lease.release() }
+                try await ensureReady(quietly: true)
+            }
             catch is CancellationError { }
             catch { engine.log("Location: not ready yet (\(message(error)))") }
             isBusy = false
@@ -525,6 +530,7 @@ final class LocationManager: ObservableObject {
         lastSuccess = nil
         Task {
             do {
+                try holdCompanionLease()
                 try await ensureReady()
                 try await engine.simulateLocation(latitude: coordinate.latitude,
                                                   longitude: coordinate.longitude)
@@ -540,6 +546,7 @@ final class LocationManager: ObservableObject {
                 stage = .notReady
                 simulated = nil
                 stopResending()
+                await discardFailedSimulation()
                 lastError = message(error)
             }
             isBusy = false
@@ -555,6 +562,7 @@ final class LocationManager: ObservableObject {
         cancelPlayback()
         stopResending()
         Task {
+            defer { releaseCompanionLease() }
             do {
                 try await engine.stopSimulatingLocation()
                 lastSuccess = L("Location reset. The device is using its own again.")
@@ -597,6 +605,7 @@ final class LocationManager: ObservableObject {
         simulated = nil
         stage = .notReady
         keepAlive.stopAll()
+        releaseCompanionLease()
         lastSuccess = nil
         lastError = ErrorHelp.explained(L("Location session closed — set it up again."))
     }
@@ -604,6 +613,22 @@ final class LocationManager: ObservableObject {
     private func stopResending() {
         resendTimer?.invalidate()
         resendTimer = nil
+    }
+
+    private func holdCompanionLease() throws {
+        if companionLease == nil { companionLease = try CompanionOperationLease.acquire() }
+    }
+
+    private func releaseCompanionLease() {
+        companionLease?.release()
+        companionLease = nil
+    }
+
+    private func discardFailedSimulation() async {
+        guard companionLease != nil else { return }
+        try? await engine.stopSimulatingLocation()
+        releaseCompanionLease()
+        keepAlive.stopAll()
     }
 
     // MARK: Saved places
@@ -689,6 +714,7 @@ final class LocationManager: ObservableObject {
         lastSuccess = nil
         Task {
             do {
+                try holdCompanionLease()
                 try await ensureReady()
                 try await engine.simulateLocation(latitude: start.latitude,
                                                   longitude: start.longitude)
@@ -700,6 +726,7 @@ final class LocationManager: ObservableObject {
                 stage = .notReady
                 simulated = nil
                 stopResending()
+                await discardFailedSimulation()
                 lastError = message(error)
             }
             isBusy = false

@@ -66,6 +66,8 @@ final class PairingManager: ObservableObject {
         isGenerating = true
         Task {
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 _ = try await PairingController.shared.startAndWait()
                 engine.connection.disconnect()
                 targets = []
@@ -149,6 +151,8 @@ final class PairingManager: ObservableObject {
         isScanning = true
         Task {
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 targets = try await engine.installedPairingTargets()
                 hasScanned = true
             } catch {
@@ -166,6 +170,8 @@ final class PairingManager: ObservableObject {
         installingTargetID = target.id
         Task {
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 try await engine.installPairing(into: target)
                 lastSuccess = L("Pairing file installed into %@.", target.name)
             } catch {
@@ -185,6 +191,8 @@ final class PairingManager: ObservableObject {
         let all = targets
         Task {
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 try await engine.installPairing(intoAll: all)
                 lastSuccess = all.count == 1
                     ? L("Pairing file installed into %@.", all[0].name)

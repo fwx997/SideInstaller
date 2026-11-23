@@ -25,6 +25,7 @@
 //! keeps it in the terminal.
 
 mod account;
+mod companion;
 mod bridge;
 mod devmode;
 mod fail;
@@ -577,13 +578,23 @@ async fn pipeline(args: &Args) -> Result<()> {
     ui::done(&format!("installed · {uploaded}"));
 
     ui::step(7, "Handing SideInstaller the pairing");
-    seed::hand_over(&mut connection, &signed.bundle_id, &pairing_path, &session).await?;
-    ui::done("SideInstaller has the pairing and signing key");
+    seed::hand_over(&mut connection, &signed.bundle_id, &pairing_path, &session,
+                    signed.companion.as_ref(), &device.udid, &args.device.ip().to_string()).await?;
+    ui::done(if signed.companion.is_some() {
+        "the companion apps have the pairing and existing signing identity"
+    } else {
+        "SideInstaller has the pairing and signing key"
+    });
 
     // Its own URL scheme (ios-app/Info.plist): the page's button opens it.
-    ui::link("Open SideInstaller", "sideinstaller://");
+    let (open_title, open_url) = if signed.companion.is_some() {
+        ("Open LiveContainer", "livecontainer://")
+    } else {
+        ("Open SideInstaller", "sideinstaller://")
+    };
+    ui::link(open_title, open_url);
     ui::finish(
-        "SideInstaller is installed",
+        &format!("{} is installed", signed.name),
         &[
             "Open it from your Home Screen. The first time, iOS asks you to trust your Apple \
              Account: Settings › General › VPN & Device Management.",

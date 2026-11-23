@@ -33,8 +33,11 @@ pub async fn hand_over(
     bundle_id: &str,
     pairing_path: &Path,
     session: &crate::account::Session,
+    companion: Option<&crate::companion::Layout>,
+    udid: &str,
+    device_ip: &str,
 ) -> Result<()> {
-    ui::activity("opening SideInstaller's container");
+    ui::activity("opening the installed app's container");
     let pairing = std::fs::read(pairing_path).map_err(|e| {
         Fail::new(
             format!("Couldn't read {}.", pairing_path.display()),
@@ -48,27 +51,27 @@ pub async fn hand_over(
             .map_err(|e| Fail::new("Couldn't reach house_arrest on this iPhone.", chain(&e)))?;
     let mut afc = house_arrest.vend_container(bundle_id).await.map_err(|e| {
         Fail::new(
-            format!("Couldn't open {bundle_id}'s container. Import the pairing file in SideInstaller instead: it's at ~/.siboot/rp_pairing_file.plist in Minis."),
+            format!("Couldn't open {bundle_id}'s container. Run siboot again to complete setup; the pairing and signing key remain in ~/.siboot."),
             chain(&e),
         )
     })?;
 
-    for dir in ["/Library", "/Library/Application Support"] {
-        let _ = afc.mk_dir(dir).await;
-    }
+    let installer_home = companion.map(|_| crate::companion::INSTALLER_HOME).unwrap_or("");
+    create_directories(&mut afc, &format!("{installer_home}/Library/Application Support")).await?;
     ui::activity("writing the pairing file into it");
-    let written = write_verified(&mut afc, PAIRING_PATH, &pairing).await?;
+    let written = write_atomic(&mut afc, &format!("{installer_home}{PAIRING_PATH}"), &pairing).await?;
     ui::ok(&format!(
         "pairing file written into SideInstaller ({written} bytes, read back and checked)"
     ));
-    crate::identity::hand_over(&mut afc, session).await?;
+    crate::identity::hand_over(&mut afc, session, installer_home).await?;
 
     // There's none on a fresh install; one from an older pairing would hand
     // other apps that pairing.
-    let _ = afc.remove(MERGED_PATH).await;
+    let _ = afc.remove(format!("{installer_home}{MERGED_PATH}")).await;
 
-    let prefs_path = format!("/Library/Preferences/{bundle_id}.plist");
-    match mark_imported(&mut afc, &prefs_path).await {
+    let installer_id = companion.map(|layout| layout.installer_bundle_id.as_str()).unwrap_or(bundle_id);
+    let prefs_path = format!("{installer_home}/Library/Preferences/{installer_id}.plist");
+    match mark_imported(&mut afc, &prefs_path, &session.anisette_server, device_ip).await {
         Ok(()) => ui::detail(&format!(
             "marked it as the imported file \"{HANDED_OVER_NAME}\" ({prefs_path})"
         )),
@@ -80,27 +83,45 @@ pub async fn hand_over(
             ui::detail(&e.raw);
         }
     }
+    if let Some(layout) = companion {
+        crate::companion::hand_over_store(&mut afc, &pairing, udid, &session.anisette_server, device_ip, layout).await?;
+    }
     Ok(())
 }
 
 /// Set `importedPairingFileName` in SideInstaller's preferences, keeping what's
 /// there. Written beside the file and renamed over it, so a broken upload can't
 /// leave a half-written preferences file.
-async fn mark_imported(afc: &mut AfcClient, prefs_path: &str) -> Result<()> {
-    let mut prefs = match read_if_present(afc, prefs_path).await? {
-        Some(bytes) if !bytes.is_empty() => plist::from_bytes::<plist::Dictionary>(&bytes)
-            .map_err(|e| Fail::new("SideInstaller's preferences aren't a plist.", e.to_string()))?,
-        _ => plist::Dictionary::new(),
-    };
+async fn mark_imported(afc: &mut AfcClient, prefs_path: &str, server: &str, device_ip: &str) -> Result<()> {
+    let mut prefs = read_preferences(afc, prefs_path).await?;
     prefs.insert(IMPORTED_NAME_KEY.into(), HANDED_OVER_NAME.into());
+    if !prefs.contains_key("anisetteServerURL") {
+        prefs.insert("anisetteServerURL".into(), server.into());
+    }
+    if !prefs.contains_key("deviceIP") {
+        prefs.insert("deviceIP".into(), device_ip.into());
+    }
+    write_preferences(afc, prefs_path, &prefs).await
+}
+
+pub(crate) async fn read_preferences(afc: &mut AfcClient, path: &str) -> Result<plist::Dictionary> {
+    match read_if_present(afc, path).await? {
+        Some(bytes) if !bytes.is_empty() => plist::from_bytes::<plist::Dictionary>(&bytes)
+            .map_err(|e| Fail::new("The app's preferences aren't a plist; they were not replaced.", e.to_string())),
+        _ => Ok(plist::Dictionary::new()),
+    }
+}
+
+pub(crate) async fn write_preferences(afc: &mut AfcClient, prefs_path: &str, prefs: &plist::Dictionary) -> Result<()> {
     let mut bytes = Vec::new();
-    plist::to_writer_binary(&mut bytes, &prefs).map_err(|e| {
+    plist::to_writer_binary(&mut bytes, prefs).map_err(|e| {
         Fail::new(
             "Couldn't encode SideInstaller's preferences.",
             e.to_string(),
         )
     })?;
-    let _ = afc.mk_dir("/Library/Preferences").await;
+    let directory = prefs_path.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("/");
+    create_directories(afc, directory).await?;
     let staging = format!("{prefs_path}.siboot");
     write_verified(afc, &staging, &bytes).await?;
     afc.rename(staging, prefs_path)
@@ -109,9 +130,25 @@ async fn mark_imported(afc: &mut AfcClient, prefs_path: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) async fn create_directories(afc: &mut AfcClient, path: &str) -> Result<()> {
+    let mut current = String::new();
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        current.push('/');
+        current.push_str(part);
+        if let Err(error) = afc.mk_dir(current.clone()).await {
+            if afc.get_file_info(current.clone()).await.is_err() {
+                return Err(Fail::new(format!("Couldn't create {current}."), chain(&error)));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn read_if_present(afc: &mut AfcClient, path: &str) -> Result<Option<Vec<u8>>> {
-    if afc.get_file_info(path).await.is_err() {
-        return Ok(None);
+    match afc.get_file_info(path).await {
+        Ok(_) => (),
+        Err(idevice::IdeviceError::Afc(idevice::afc::errors::AfcError::ObjectNotFound)) => return Ok(None),
+        Err(error) => return Err(Fail::new(format!("Couldn't inspect {path}. It was not replaced."), chain(&error))),
     }
     let mut file = afc
         .open(path, AfcFopenMode::RdOnly)
@@ -123,6 +160,14 @@ pub(crate) async fn read_if_present(afc: &mut AfcClient, path: &str) -> Result<O
         .map_err(|e| Fail::new(format!("Couldn't read {path}."), chain(&e)))?;
     let _ = file.close().await;
     Ok(Some(bytes))
+}
+
+pub(crate) async fn write_atomic(afc: &mut AfcClient, path: &str, data: &[u8]) -> Result<usize> {
+    let pending = format!("{path}.pending-siboot-{}", uuid::Uuid::new_v4());
+    let written = write_verified(afc, &pending, data).await?;
+    afc.rename(&pending, path).await
+        .map_err(|e| Fail::new(format!("Couldn't activate {path}; the previous copy was retained."), chain(&e)))?;
+    Ok(written)
 }
 
 /// Write `data` to `path`, then read it back and compare. Returns its length.

@@ -32,6 +32,11 @@ final class UpdateChecker: ObservableObject {
 
     /// Fetch the latest release's tag and reveal the banner if it's newer.
     func check() async {
+        guard !Engine.isBuiltInCompanion else {
+            latestVersion = nil
+            showBanner = false
+            return
+        }
         guard let url = URL(string: Self.latestReleaseAPIURL) else { return }
         var req = URLRequest(url: url)
         req.cachePolicy = .reloadIgnoringLocalCacheData

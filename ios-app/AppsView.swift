@@ -415,6 +415,8 @@ final class SideloadedAppsManager: ObservableObject {
         if !quiet { engine.log("=== Sideloaded apps: reading the device ===") }
         Task {
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 let inventory = try await engine.sideloadedAppInventory()
                 let apps = inventory.apps.compactMap(SideloadedApp.init(plist:))
                 // TestFlight apps' profiles would otherwise show as unused.
@@ -458,12 +460,15 @@ final class SideloadedAppsManager: ObservableObject {
         engine.log("=== Refresh all: \(jobs.count) app(s) ===")
 
         refreshTask = Task {
+            var companionLease: CompanionOperationLease.Token?
             defer {
+                companionLease?.release()
                 isRefreshing = false
                 refreshStatus = nil
                 refreshTask = nil
             }
             do {
+                companionLease = try CompanionOperationLease.acquire()
                 try await engine.prepareRefresh()
             } catch {
                 let message = Self.text(for: error)

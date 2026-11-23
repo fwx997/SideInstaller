@@ -42,7 +42,7 @@ struct SideInstallerApp: App {
                 } else {
                     // The terms, the sideinstaller.net question and the Apple
                     // ID, a page each; the pages move among themselves.
-                    SetupView()
+                    companionSetupView
                         .environmentObject(localizer)
                         .environmentObject(accounts)
                         // Zoom past the camera while the app fades in beneath.
@@ -72,6 +72,19 @@ struct SideInstallerApp: App {
                     Task { await engine.importCustomIPA(from: url) }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var companionSetupView: some View {
+        if Engine.isBuiltInCompanion {
+            NavigationStack {
+                SetupView()
+                    .navigationTitle("SideInstaller")
+                    .navigationBarTitleDisplayMode(.inline)
+            }
+        } else {
+            SetupView()
         }
     }
 }

@@ -128,19 +128,20 @@ async fn from_installed_app(args: &Args, session: &Session, certs: &[Development
     ui::status("looking for the existing key in SideInstaller on this device");
     let mut connection = tunnel::open(args.device, &args.pairing_path()).await?;
     let account = relative_key(session)?;
-    for base in ["com.frizzlem.sideinstaller", "com.frizzle.sideinstaller"] {
+    for base in ["com.frizzlem.sideinstaller", "com.frizzle.sideinstaller", "com.kdt.livecontainer"] {
         let bundle_id = format!("{base}.{}", session.selected_team.team_id);
         let house = HouseArrestClient::connect_rsd(&mut connection.adapter, &mut connection.handshake).await;
         let Ok(house) = house else { continue };
         let Ok(mut afc) = house.vend_container(&bundle_id).await else { continue };
-        if adopt_from_container(&mut afc, session, certs, &account).await? { return Ok(true) }
+        let root = if base == "com.kdt.livecontainer" { crate::companion::INSTALLER_HOME } else { "" };
+        if adopt_from_container(&mut afc, session, certs, &account, root).await? { return Ok(true) }
     }
     Ok(false)
 }
 
-async fn adopt_from_container(afc: &mut AfcClient, session: &Session, certs: &[DevelopmentCertificate], relative: &str) -> Result<bool> {
+async fn adopt_from_container(afc: &mut AfcClient, session: &Session, certs: &[DevelopmentCertificate], relative: &str, home: &str) -> Result<bool> {
     for root in ["/Library/Application Support/isideload", "/Documents/isideload"] {
-        let path = format!("{root}/{relative}");
+        let path = format!("{home}{root}/{relative}");
         let Some(data) = read_remote_key(afc, &path).await? else { continue };
         let Ok(key) = RsaPrivateKey::from_pkcs8_der(&data) else { continue };
         if matches(&key, certs)? {
@@ -194,12 +195,12 @@ fn save_key(path: &Path, key: &RsaPrivateKey) -> Result<()> {
     std::fs::rename(&temporary, path).map_err(|e| Fail::new("Couldn't activate the imported signing key.", e.to_string()))
 }
 
-pub async fn hand_over(afc: &mut AfcClient, session: &Session) -> Result<()> {
+pub async fn hand_over(afc: &mut AfcClient, session: &Session, home: &str) -> Result<()> {
     let relative = relative_key(session)?;
     let local = session.storage.join(&relative);
     let key = read_key(&local)?.ok_or_else(|| Fail::new("The signing key is missing after signing.", "missing key"))?;
     let data = key.to_pkcs8_der().map_err(|e| Fail::new("Couldn't encode the signing key.", e.to_string()))?;
-    let root = "/Library/Application Support/isideload";
+    let root = format!("{home}/Library/Application Support/isideload");
     let directory = format!("{root}/{}", relative.trim_end_matches("/key"));
     let target = format!("{root}/{relative}");
     let _ = afc.mk_dir(root).await;

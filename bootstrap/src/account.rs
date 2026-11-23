@@ -75,6 +75,7 @@ pub struct Session {
     pub sideloader: Sideloader,
     pub apple_id: String,
     pub storage: std::path::PathBuf,
+    pub anisette_server: String,
     pub developer: DeveloperSession,
     pub selected_team: DeveloperTeam,
     /// The developer team signing for it, as the step's summary: "paid team
@@ -216,6 +217,7 @@ async fn signed_in(
         sideloader,
         apple_id: apple_id.to_string(),
         storage: storage.to_path_buf(),
+        anisette_server: server.to_string(),
         developer: identity_developer,
         selected_team,
         team,

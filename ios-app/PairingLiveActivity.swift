@@ -21,10 +21,12 @@ final class PairingLiveActivity: PairingCodeSurface {
     /// FrizzleM/SideInstaller-Signed), and an activity started then would be
     /// an empty box. `PairingNotification` stands in there.
     nonisolated static let hasExtension: Bool = {
-        guard let plugIns = Bundle.main.builtInPlugInsURL,
-              let contents = try? FileManager.default.contentsOfDirectory(
-                at: plugIns, includingPropertiesForKeys: nil) else { return false }
-        return contents.contains { $0.pathExtension == "appex" }
+        let host = Engine.companionHostBundle ?? .main
+        guard let plugIns = host.builtInPlugInsURL else { return false }
+        let url = plugIns.appendingPathComponent("SideInstallerLiveActivity.appex", isDirectory: true)
+        guard let extensionBundle = Bundle(url: url),
+              let executable = extensionBundle.executableURL else { return false }
+        return FileManager.default.fileExists(atPath: executable.path)
     }()
 
     /// True when a pairing run will show its code over Settings: the extension

@@ -150,6 +150,8 @@ final class CertManager: ObservableObject {
         engine.log("=== Certificates: loading ===")
         Task { @MainActor in
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 if session == nil { try await signIn(id: id, pw: pw) }
                 let list = try await onQueue { try self.performList() }
                 certs = list
@@ -184,6 +186,8 @@ final class CertManager: ObservableObject {
         Task { @MainActor in
             var revoked = false
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 try await onQueue { try self.performRevoke(serial: serial) }
                 revoked = true
                 engine.log("Certificates: revoked \(cert.displayName).")
@@ -219,6 +223,8 @@ final class CertManager: ObservableObject {
         Task { @MainActor in
             defer { exportingID = nil }
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 let file = try Self.exportFile(for: cert)
                 do {
                     try await onQueue { try self.performExport(serial: serial, password: password, to: file) }
@@ -331,6 +337,8 @@ final class CertManager: ObservableObject {
         Task { @MainActor in
             defer { isImporting = false }
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 if session == nil { try await signIn(id: id, pw: pw) }
                 let result = try await importFirstOnTeam(candidates)
                 let name = result.certificate.machineLabel ?? result.certificate.displayName

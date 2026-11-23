@@ -139,6 +139,7 @@ final class PairingController {
         /// Set by `cancel(_:)`, so the run stops advertising and its end isn't
         /// reported as a failure.
         var cancelled = false
+        var companionLease: CompanionOperationLease.Token?
         /// Stops the Rust host whatever stage it's at (`si_pairing_cancel`).
         /// Freed with the run: the background call holds the run until
         /// `si_pairing_run_host` has returned, and only the main actor cancels.
@@ -245,6 +246,13 @@ final class PairingController {
             resolve(run, .failure(PairingError.busy))
             return
         }
+        do {
+            run.companionLease = try CompanionOperationLease.acquire()
+        } catch {
+            engine.lastError = error.localizedDescription
+            resolve(run, .failure(error))
+            return
+        }
         running = true
         current = run
         if run.isThisDevice { engine.pairingStatus = L("requesting Local Network…") }
@@ -345,6 +353,8 @@ final class PairingController {
     /// Frees the host for the next run.
     private func end(_ run: HostRun) {
         guard current === run else { return }
+        run.companionLease?.release()
+        run.companionLease = nil
         running = false
         current = nil
     }

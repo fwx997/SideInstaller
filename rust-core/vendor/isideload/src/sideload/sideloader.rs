@@ -80,6 +80,7 @@ pub struct Sideloader {
     #[cfg_attr(not(feature = "install"), allow(dead_code))]
     delete_app_after_install: bool,
     team: Option<DeveloperTeam>,
+    last_signed_identity: Option<(String, String)>,
 }
 
 impl Sideloader {
@@ -106,6 +107,7 @@ impl Sideloader {
             //extensions_behavior,
             delete_app_after_install,
             team: None,
+            last_signed_identity: None,
         }
     }
 
@@ -130,6 +132,7 @@ impl Sideloader {
         register_device: Option<(&str, &str)>,
         pairing_file: Option<&[u8]>,
     ) -> Result<(PathBuf, Option<SpecialApp>), Report> {
+        self.last_signed_identity = None;
         let team = match team {
             Some(t) => t,
             None => self.get_team().await?,
@@ -190,7 +193,7 @@ impl Sideloader {
 
             let main_bundle_id = app.main_bundle_id()?;
             let main_app_name = app.main_app_name()?;
-            let main_app_id_str = format!("{}.{}", main_bundle_id, team.team_id);
+            let main_app_id_str = signed_bundle_id(&main_bundle_id, &team.team_id);
             app.update_bundle_id(&main_bundle_id, &main_app_id_str)?;
 
             let group_identifier = format!(
@@ -310,6 +313,7 @@ impl Sideloader {
         .context("Failed to sign app")?;
 
         info!("App signed!");
+        self.last_signed_identity = Some((cert_identity.get_serial_number(), cert_identity.machine_id.clone()));
 
         Ok((app.bundle.bundle_dir.clone(), special))
     }
@@ -404,11 +408,57 @@ impl Sideloader {
     pub fn get_email(&self) -> &str {
         &self.apple_email
     }
+
+    /// The serial and exact password of the PKCS#12 embedded by the last sign.
+    /// Kept in memory for a local handoff only; it must never be logged.
+    pub fn take_last_signed_identity(&mut self) -> Option<(String, String)> {
+        self.last_signed_identity.take()
+    }
+}
+
+/// Re-signing the same team's package is an upgrade, not another app ID.
+fn signed_bundle_id(bundle_id: &str, team_id: &str) -> String {
+    let suffix = format!(".{team_id}");
+    if bundle_id.ends_with(&suffix) {
+        bundle_id.to_string()
+    } else {
+        format!("{bundle_id}{suffix}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryLimit, SpecialApp};
+    use super::{signed_bundle_id, MemoryLimit, SpecialApp};
+
+    #[test]
+    fn signing_again_with_the_same_team_keeps_the_installed_identifier() {
+        let signed = signed_bundle_id("com.kdt.livecontainer", "TEAMID1234");
+        assert_eq!(signed, "com.kdt.livecontainer.TEAMID1234");
+        assert_eq!(signed_bundle_id(&signed, "TEAMID1234"), signed);
+        assert_eq!(signed_bundle_id("com.example.TEAMID1234.helper", "TEAMID1234"),
+                   "com.example.TEAMID1234.helper.TEAMID1234");
+        assert_eq!(signed_bundle_id(&signed, "OTHER12345"),
+                   "com.kdt.livecontainer.TEAMID1234.OTHER12345");
+    }
+
+    #[test]
+    fn repeated_signing_keeps_the_host_and_extension_identifiers_together() {
+        use crate::sideload::{application::Application, bundle::Bundle};
+        use crate::sideload::bundle::tests::{TempDir, write_app_with_both_extension_kinds};
+        let directory = TempDir::new();
+        let folder = write_app_with_both_extension_kinds(&directory.0);
+        let mut app = Application { bundle: Bundle::new(folder).unwrap() };
+        for _ in 0..3 {
+            let previous = app.main_bundle_id().unwrap();
+            let next = signed_bundle_id(&previous, "TEAMID1234");
+            app.update_bundle_id(&previous, &next).unwrap();
+            assert_eq!(app.main_bundle_id().unwrap(), "com.zarz.mornye.TEAMID1234");
+            let identifiers: Vec<_> = app.bundle.app_extensions().iter()
+                .map(|extension| extension.bundle_identifier().unwrap()).collect();
+            assert!(identifiers.contains(&"com.zarz.mornye.TEAMID1234.PlayerWidget"));
+            assert!(identifiers.contains(&"com.zarz.mornye.TEAMID1234.LinkNowPlaying"));
+        }
+    }
 
     #[test]
     fn memory_limit_leaves_out_the_app_stores_that_refresh_themselves() {

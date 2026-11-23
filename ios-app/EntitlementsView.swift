@@ -179,6 +179,8 @@ final class EntitlementsManager: ObservableObject {
         engine.log("=== Entitlements: loading App IDs ===")
         Task { @MainActor in
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 if session == nil { try await signIn(id: id, pw: pw) }
                 let list = try await onQueue { try self.performList() }
                 apps = list.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
@@ -204,6 +206,8 @@ final class EntitlementsManager: ObservableObject {
         engine.log("Entitlements: enabling \(ids.count) capability(ies) on \(app.identifier) …")
         Task { @MainActor in
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 let results = try await onQueue { try self.performEnable(appIdId: app.appIdId, ids: ids) }
                 outcomes[app.id] = results
                 reportedID = app.id

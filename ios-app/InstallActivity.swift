@@ -403,8 +403,11 @@ final class InstallActivity {
     // MARK: iOS 26 and later: a continued-processing task
 
     /// The identifiers Info.plist lets the app submit.
-    private static let permittedTaskIDs: [String] =
-        Bundle.main.object(forInfoDictionaryKey: "BGTaskSchedulerPermittedIdentifiers") as? [String] ?? []
+    private static var taskBundle: Bundle { Engine.companionHostBundle ?? .main }
+
+    private static var permittedTaskIDs: [String] {
+        taskBundle.object(forInfoDictionaryKey: "BGTaskSchedulerPermittedIdentifiers") as? [String] ?? []
+    }
 
     /// Submits the run as a background task; false when it can't be. iOS may
     /// still turn it down afterwards (`taskRefused`).
@@ -414,7 +417,7 @@ final class InstallActivity {
         // iOS takes only identifiers under the app's own bundle ID, and those
         // Info.plist allows. A build signed under another bundle ID has the
         // original one in its Info.plist, and gets the Live Activity.
-        guard let bundleID = Bundle.main.bundleIdentifier,
+        guard let bundleID = Self.taskBundle.bundleIdentifier,
               Self.permittedTaskIDs.contains("\(bundleID).install.*") else {
             engine.log("Background task: Info.plist doesn't allow one under this bundle ID — showing a Live Activity instead.")
             return false

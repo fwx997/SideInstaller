@@ -86,6 +86,11 @@ struct RootView: View {
                 .tabItem { Label(L("About"), systemImage: "info.circle") }
                 .tag(Page.about)
         }
+        .onAppear {
+            SICompanionBridge.bind(pairing: pairingManager, certificates: certManager,
+                                   entitlements: entitlementsManager, location: locationManager,
+                                   apps: appsManager, sideBySide: sideBySideManager)
+        }
         // A link's install or pairing file ends up on the Install tab, so its
         // popup comes up over that.
         .onChange(of: engine.pendingLink) { _, link in
