@@ -10,6 +10,7 @@ struct SideInstallerApp: App {
     @StateObject private var localizer = Localizer.shared
     // The saved Apple IDs, shared by every screen that signs in.
     @StateObject private var accounts = AccountStore.shared
+    @Environment(\.scenePhase) private var scenePhase
     /// False until the TOS is accepted on the first setup page.
     @AppStorage(SetupView.acceptedTermsKey) private var hasAcceptedTOS = false
     /// False until account setup is completed or skipped. Never reset, even if
@@ -59,6 +60,7 @@ struct SideInstallerApp: App {
             // an alternative to the document picker, and `sideinstaller://`
             // links, which ask before doing anything.
             .onOpenURL { url in
+                if CompanionShortcutReceiver.shared.receive(url) { return }
                 guard url.isFileURL else {
                     engine.receiveLink(url)
                     return
@@ -72,6 +74,8 @@ struct SideInstallerApp: App {
                     Task { await engine.importCustomIPA(from: url) }
                 }
             }
+            .onAppear { CompanionShortcutReceiver.refreshCaches() }
+            .onChange(of: scenePhase) { _, _ in CompanionShortcutReceiver.refreshCaches() }
         }
     }
 

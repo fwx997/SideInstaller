@@ -24,6 +24,9 @@ final class SICompanionBridge: NSObject {
     }
 
     @objc static func switchBlockReason() -> String? {
+        if CompanionShortcutReceiver.shared.isRunning {
+            return "SideInstaller 正在执行快捷指令，请等待完成或停止快捷指令后再切换。"
+        }
         let engine = Engine.shared
         if engine.isRunning || engine.isCancelling || engine.isImportingIPA || engine.isImportingPairing {
             return "SideInstaller 正在安装或导入，请完成后再切换。"
