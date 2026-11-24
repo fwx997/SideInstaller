@@ -11,16 +11,19 @@ final class SICompanionBridge: NSObject {
     private static weak var location: LocationManager?
     private static weak var apps: SideloadedAppsManager?
     private static weak var sideBySide: SideBySideManager?
+    private static weak var jit: JITManager?
 
     static func bind(pairing: PairingManager, certificates: CertManager,
                      entitlements: EntitlementsManager, location: LocationManager,
-                     apps: SideloadedAppsManager, sideBySide: SideBySideManager) {
+                     apps: SideloadedAppsManager, sideBySide: SideBySideManager,
+                     jit: JITManager) {
         self.pairing = pairing
         self.certificates = certificates
         self.entitlements = entitlements
         self.location = location
         self.apps = apps
         self.sideBySide = sideBySide
+        self.jit = jit
     }
 
     @objc static func switchBlockReason() -> String? {
@@ -42,6 +45,9 @@ final class SICompanionBridge: NSObject {
         }
         if apps?.isWorking == true || apps?.isRefreshing == true {
             return "正在管理或续签应用，请完成后再切换。"
+        }
+        if jit?.isBusy == true || jit?.isLoading == true || jit?.isPairing == true {
+            return "正在准备或运行 JIT，请先结束会话再切换应用。"
         }
         if location?.isSimulating == true || location?.isPlayingRoute == true {
             return "请先在虚拟定位中停止模拟，再切换应用。"
