@@ -713,12 +713,8 @@ final class Engine {
         }
         // The install runs over the loopback tunnel, so require it up front,
         // unless the run can start LocalDevVPN itself (see `ensureNetwork`).
+        // Wi-Fi isn't required: without it, pairing offers Mobile Data Mode.
         refreshNetworkStatus()
-        guard !needsFreshPairing || wifiConnected else {
-            setGuide(Guides.wifi)
-            log("⛔️ Wi-Fi is off, and pairing this iPhone needs it. Connect to a Wi-Fi network, then tap Install again.")
-            return
-        }
         guard tunnelAvailable else {
             // A full-tunnel VPN counts as down until its probe answers, which
             // takes half a second at most: wait for it, then decide.
@@ -750,36 +746,7 @@ final class Engine {
             var outcome = InstallActivity.Outcome.cancelled
             do {
                 companionLease = try CompanionOperationLease.acquire()
-                try await ensureNetwork()
-                // The download needs neither the device nor the Apple ID, so it
-                // starts now and runs while those steps do.
-                startPrefetch()
-                try await pairAndConnect()
-                // Device work that doesn't need the signed app starts on the fresh
-                // link and runs through sign-in, download and signing.
-                startDevicePreparation()
-                try await signInStep()
-                try await download()
-                // Signing registers App IDs, which a free Apple ID has few of,
-                // so an imported IPA waits for the go-ahead first, unless it's
-                // one of SideInstaller's own builds, installed like its download.
-                if installedBuild == .custom {
-                    try await confirmAppIDCost()
-                }
-                // Most of the app is the same signed or not, so that part goes
-                // to the device while signing runs.
-                startPrestage()
-                try await signApp()
-                // The certificate hand-off is built on the sign queue, which the
-                // install doesn't use, so it's ready once the install is done.
-                let accountConfig = startAccountConfig()
-                // Both share the device queue with the install.
-                let prepared = await devicePreparation?.value
-                let staged = await prestage?.value
-                try Task.checkCancellation()
-                try await install(prestaged: staged)
-                try await writePairing(accountConfig: accountConfig, prepared: prepared)
-                finishSuccess()
+                try await MobileDataMode.shared.run(.install) { try await performInstallSteps() }
                 outcome = .installed
             } catch is CancellationError {
                 log("Install cancelled.")
@@ -801,6 +768,49 @@ final class Engine {
             pairingPIN = nil
             InstallActivity.shared.runEnded(outcome)
         }
+    }
+
+    @MainActor
+    private func performInstallSteps() async throws {
+        try await ensureNetwork()
+        // On mobile data alone the device link may need Airplane Mode
+        // (`MobileDataMode`), which takes the internet away, so the
+        // download and the sign-in wait until it's off again.
+        let mobileDataOnly = NetworkStatus.links().mobileDataOnly
+        // The download needs neither the device nor the Apple ID, so it
+        // starts now and runs while those steps do.
+        if !mobileDataOnly { startPrefetch() }
+        try await pairAndConnect(signsInEarly: !mobileDataOnly)
+        if mobileDataOnly {
+            try await MobileDataMode.shared.requireInternet(.install)
+            startPrefetch()
+            startBackgroundSignIn()
+        }
+        // Device work that doesn't need the signed app starts on the fresh
+        // link and runs through sign-in, download and signing.
+        startDevicePreparation()
+        try await signInStep()
+        try await download()
+        // Signing registers App IDs, which a free Apple ID has few of,
+        // so an imported IPA waits for the go-ahead first, unless it's
+        // one of SideInstaller's own builds, installed like its download.
+        if installedBuild == .custom {
+            try await confirmAppIDCost()
+        }
+        // Most of the app is the same signed or not, so that part goes
+        // to the device while signing runs.
+        startPrestage()
+        try await signApp()
+        // The certificate hand-off is built on the sign queue, which the
+        // install doesn't use, so it's ready once the install is done.
+        let accountConfig = startAccountConfig()
+        // Both share the device queue with the install.
+        let prepared = await devicePreparation?.value
+        let staged = await prestage?.value
+        try Task.checkCancellation()
+        try await install(prestaged: staged)
+        try await writePairing(accountConfig: accountConfig, prepared: prepared)
+        finishSuccess()
     }
 
     /// Stop the pipeline at the next safe point.
@@ -927,7 +937,7 @@ final class Engine {
 
     // MARK: Step 1 — network (waits for the loopback tunnel)
 
-    /// True when this run must pair from scratch, the one step needing Wi-Fi.
+    /// True when this run must pair from scratch.
     var needsFreshPairing: Bool {
         !fileExistsNonEmpty(pairingFilePath ?? PairingController.pairingFilePath())
     }
@@ -945,9 +955,9 @@ final class Engine {
             // Waits for a full-tunnel VPN's probe when there's no fresh answer.
             let (vpn, wifi, detail) = await readNetworkSettled()
             publishNetwork(vpn: vpn, wifi: wifi, vpnText: vpn ? "tunnel up" : "no tunnel")
-            // Only a run that pairs needs Wi-Fi; the tunnel is always required.
-            let wifiSatisfied = wifi || !needsFreshPairing
-            if wifiSatisfied && vpn {
+            // Only the tunnel is required. Without Wi-Fi, the steps that need
+            // a new connection offer Mobile Data Mode instead.
+            if vpn {
                 // Install checks this too, but only while a tunnel is up, and
                 // this run may have started it.
                 guard deviceIPIsUsable() else {
@@ -960,28 +970,21 @@ final class Engine {
                 return
             }
             setStep(.network, .waiting)
-            if !wifiSatisfied {
-                // Wi-Fi is the prerequisite for pairing, so surface it first.
-                if announced != "wifi" {
-                    log("Waiting for Wi-Fi… pairing this iPhone needs it. Connect to a Wi-Fi network.")
-                    announced = "wifi"
-                }
-                setGuide(Guides.wifi)
-            } else {
-                if announced != "vpn" {
-                    log("Waiting for the loopback tunnel… connect LocalDevVPN, ClashMi, or whichever VPN app you use.")
-                    announced = "vpn"
-                }
-                setGuide(Guides.vpn)
+            if announced != "vpn" {
+                log("Waiting for the loopback tunnel… connect LocalDevVPN, ClashMi, or whichever VPN app you use.")
+                announced = "vpn"
             }
+            setGuide(Guides.vpn)
             try await Task.sleep(nanoseconds: 1_500_000_000)
         }
     }
 
     // MARK: Step 2+3 — pair, then connect (with a one-shot re-pair fallback)
 
+    /// `signsInEarly` starts the Apple ID sign-in while the link opens; false
+    /// on mobile data alone, where the link may need Airplane Mode.
     @MainActor
-    private func pairAndConnect() async throws {
+    private func pairAndConnect(signsInEarly: Bool = true) async throws {
         let path = PairingController.pairingFilePath()
         let reused = fileExistsNonEmpty(path)
         if reused {
@@ -999,7 +1002,7 @@ final class Engine {
         // Pairing is settled, so sign in while the link opens. Not sooner: Apple
         // sends its own 2FA alert to this iPhone before SideInstaller is asked
         // for the code, and it would land on the user typing the pairing code.
-        startBackgroundSignIn()
+        if signsInEarly { startBackgroundSignIn() }
 
         do {
             try await connect()
@@ -1041,6 +1044,12 @@ final class Engine {
                 L("iOS %@ can't create its own pairing file — that needs iOS %@. Import one made on a computer under “Pairing file”, then try again.",
                   osVersionText, Engine.minimumOSText))
         }
+        // On mobile data alone, Mobile Data Mode can try pairing in Airplane
+        // Mode: the connection after it needs Airplane Mode anyway.
+        if NetworkStatus.links().mobileDataOnly {
+            try await MobileDataMode.shared.prepareNewTunnel(forPairing: true)
+            MobileDataMode.shared.dialEnded(opened: false)
+        }
         setStep(.pair, .waiting)
         setGuide(Guides.pairing)
         log("Pairing: starting on-device pairing service…")
@@ -1079,7 +1088,7 @@ final class Engine {
         setGuide(nil)
         let ip = deviceHost
         let path = pairingFilePath ?? PairingController.pairingFilePath()
-        let device = try await onDeviceQueue { try self.performConnect(ip: ip, pairingPath: path) }
+        let device = try await openDeviceLink { try self.performConnect(ip: ip, pairingPath: path) }
         deviceSummary = device.summary
         deviceUDID = device.udid
         deviceName = device.name
@@ -2252,11 +2261,12 @@ final class Engine {
         let ip = deviceHost
         let path = pairingFilePath ?? PairingController.pairingFilePath()
         do {
+            // iOS drops the idle tunnel during sign-in and signing, and
+            // `isConnected` doesn't detect it, so reconnect first. Mobile Data
+            // Mode reuses the tunnel it kept while that still answers.
+            log("Refreshing device link before install (tunnel was idle during sign-in/download/sign) …")
+            try await openDeviceLink { try self.connection.connect(deviceIP: ip, pairingFilePath: path) }
             try await onDeviceQueue {
-                // iOS drops the idle tunnel during sign-in and signing, and
-                // `isConnected` doesn't detect it, so reconnect first.
-                self.log("Refreshing device link before install (tunnel was idle during sign-in/download/sign) …")
-                try self.connection.connect(deviceIP: ip, pairingFilePath: path)
                 guard self.connection.isConnected else { throw EngineError.message(L("Device link dropped — reconnect.")) }
                 self.log("Installing signed bundle via AFC + installation_proxy …")
                 try self.connection.installSignedApp(bundlePath: bundle, prestaged: prestaged)
@@ -3544,11 +3554,47 @@ final class Engine {
         }
         pairingFilePath = path
         let ip = deviceHost
-        let device = try await onDeviceQueue { try self.performConnect(ip: ip, pairingPath: path) }
+        let device = try await openDeviceLink { try self.performConnect(ip: ip, pairingPath: path) }
         deviceSummary = device.summary
         deviceUDID = device.udid
         deviceName = device.name
         pairingStatus = L("connected")
+    }
+
+    /// Opens the device link with `connect`, which dials a tunnel, or reuses
+    /// the one Mobile Data Mode kept (`DeviceConnection.keepsOpenTunnel`), on
+    /// the device queue. On mobile data alone a new tunnel needs Airplane Mode,
+    /// which `MobileDataMode.prepareNewTunnel` asks for first, unless one is
+    /// kept already; when the dial is refused all the same, because the kept
+    /// tunnel had closed or Airplane Mode went off too soon, it asks again and
+    /// dials once more.
+    @MainActor
+    private func openDeviceLink<T>(_ connect: @escaping () throws -> T) async throws -> T {
+        let mode = MobileDataMode.shared
+        // A kept tunnel is tried first, inside `connect`. On Wi-Fi this turns
+        // Mobile Data Mode off, and the tunnel opens the usual way.
+        if !(mode.isOn && connection.isConnected && !NetworkStatus.links().wifi) {
+            try await mode.prepareNewTunnel()
+        }
+        do {
+            let result = try await onDeviceQueue(connect)
+            mode.dialEnded(opened: true)
+            return result
+        } catch let error as DeviceConnection.TunnelError where error.refusedOnMobileData {
+            mode.dialEnded(opened: false)
+            guard try await mode.prepareNewTunnel(again: true) else { throw error }
+            do {
+                let result = try await onDeviceQueue(connect)
+                mode.dialEnded(opened: true)
+                return result
+            } catch {
+                mode.dialEnded(opened: false)
+                throw error
+            }
+        } catch {
+            mode.dialEnded(opened: false)
+            throw error
+        }
     }
 
     /// Write the resolved pairing file into `target`'s Documents, verifying
@@ -3676,6 +3722,7 @@ final class Engine {
             throw EngineError.message(L("No Apple ID saved. Add one in Settings › Account."))
         }
         try await ensurePairingConnection()
+        try await MobileDataMode.shared.requireInternet(.signIn)
         try await signIn(updatingChecklist: false, purpose: .refresh)
     }
 
@@ -3689,6 +3736,8 @@ final class Engine {
         let device = deviceName ?? ""
         log("=== Refreshing \(name) from \((ipaPath as NSString).lastPathComponent) ===")
         let path = pairingFilePath ?? PairingController.pairingFilePath()
+        // The app before this one may have needed Airplane Mode again.
+        try await MobileDataMode.shared.requireInternet(.signing)
         let signed: String
         do {
             signed = try await onSignQueue {
@@ -3705,10 +3754,10 @@ final class Engine {
         try Self.validateCompanionInstall(at: signed)
         installProgress = 0
         let ip = deviceHost
+        // iOS may drop the tunnel during signing and `isConnected` doesn't
+        // detect it, so reconnect first (same as install).
+        try await openDeviceLink { try self.connection.connect(deviceIP: ip, pairingFilePath: path) }
         try await onDeviceQueue {
-            // iOS may drop the tunnel during signing and `isConnected` doesn't
-            // detect it, so reconnect first (same as install).
-            try self.connection.connect(deviceIP: ip, pairingFilePath: path)
             guard self.connection.isConnected else { throw EngineError.message(L("Device link dropped — reconnect.")) }
             try self.connection.installSignedApp(bundlePath: signed)
         }
@@ -3736,47 +3785,85 @@ final class Engine {
     // image and a session kept open while the location is simulated. Same
     // approach as StikDebug, over the RPPairing tunnel.
 
-    /// Connect, mount the developer disk image unless the device already has
-    /// one, and open the location session. Returns true when a mount actually
-    /// ran, so the UI can say so.
+    /// Connect, put the developer disk image on the device unless it already
+    /// has one, and open the location session. Returns true when the image
+    /// went on now, so the UI can say so.
     @MainActor
     @discardableResult
-    func prepareLocationSimulation(imagePath: String,
-                                   trustcachePath: String,
-                                   manifestPath: String,
-                                   progress: @escaping (Double) -> Void) async throws -> Bool {
-        let mounted = try await prepareDeveloperDiskImage(imagePath: imagePath,
-                                                          trustcachePath: trustcachePath,
-                                                          manifestPath: manifestPath,
-                                                          progress: progress)
+    func prepareLocationSimulation(progress: @escaping (Double) -> Void) async throws -> Bool {
+        let mounted = try await prepareDeveloperDiskImage(progress: progress)
         try await onDeviceQueue { try self.connection.beginLocationSimulation() }
         return mounted
     }
 
-    /// Connect, and mount the developer disk image unless the device already
-    /// has one. Location simulation and JIT both need it: DVT and debugserver
-    /// come with it. Returns true when a mount actually ran.
+    /// Connect, and put the developer disk image on the device unless it
+    /// already has one. Location simulation and JIT both need it: DVT and
+    /// debugserver come with it. Returns true when it went on now.
+    ///
+    /// From iOS 26.4 it's installed as a cryptex, as StikDebug installs it,
+    /// which newer iPhones than the personalized image knows take too; when
+    /// that fails, the personalized image is mounted instead
+    /// (`DeveloperDiskImage.variants`). A form not downloaded yet is
+    /// downloaded first. `progress` follows the personalized mount, the one
+    /// that reports any.
     @MainActor
     @discardableResult
-    func prepareDeveloperDiskImage(imagePath: String,
-                                   trustcachePath: String,
-                                   manifestPath: String,
-                                   progress: @escaping (Double) -> Void) async throws -> Bool {
+    func prepareDeveloperDiskImage(progress: @escaping (Double) -> Void) async throws -> Bool {
         try await ensurePairingConnection()
-        let mounted = try await onDeviceQueue { try self.connection.mountedDeveloperImageCount() }
-        if mounted > 0 {
-            log("Developer disk image already mounted (\(mounted) image(s)).")
+        let checksCryptex = DeveloperDiskImage.installsAsCryptex
+        let present = try await onDeviceQueue {
+            try self.connection.developerImagePresence(checkingCryptex: checksCryptex)
+        }
+        if let present {
+            log("Developer disk image already on the device (\(present)).")
             return false
         }
-        log("No developer disk image mounted — mounting the personalized one…")
-        try await onDeviceQueue {
-            try self.connection.mountPersonalizedDeveloperImage(imagePath: imagePath,
-                                                               trustcachePath: trustcachePath,
-                                                               manifestPath: manifestPath,
-                                                               progress: progress)
+        // Apple signs the image for this iPhone as it goes on.
+        try await MobileDataMode.shared.requireInternet(.diskImage)
+        let variants = DeveloperDiskImage.variants
+        var firstFailure: Error?
+        for (index, variant) in variants.enumerated() {
+            do {
+                if !DeveloperDiskImage.isDownloaded(variant) {
+                    try await DeveloperDiskImage.downloadMissing(variant) { _ in }
+                }
+                switch variant {
+                case .cryptex:
+                    log("No developer disk image on the device — installing it as a cryptex…")
+                    let directory = DeveloperDiskImage.cryptexDirectory
+                    let version = try await onDeviceQueue {
+                        try self.connection.installCryptexDeveloperImage(directory: directory)
+                    }
+                    log("Developer disk image installed as a cryptex\(version.isEmpty ? "" : " (\(version))").")
+                case .personalized:
+                    log("No developer disk image on the device — mounting the personalized one…")
+                    let image = DeveloperDiskImage.imagePath
+                    let trustcache = DeveloperDiskImage.trustcachePath
+                    let manifest = DeveloperDiskImage.manifestPath
+                    try await onDeviceQueue {
+                        try self.connection.mountPersonalizedDeveloperImage(imagePath: image,
+                                                                           trustcachePath: trustcache,
+                                                                           manifestPath: manifest,
+                                                                           progress: progress)
+                    }
+                    log("Developer disk image mounted.")
+                }
+                return true
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // What the preferred form said is what's reported; the
+                // fallback's failure is in the log.
+                if firstFailure == nil { firstFailure = error }
+                if index + 1 < variants.count {
+                    log("The developer disk image didn't go on as a \(variant.logName) (\(short(error))). Trying the \(variants[index + 1].logName) …")
+                } else if index > 0 {
+                    log("The \(variant.logName) didn't go on either (\(short(error))).")
+                }
+            }
         }
-        log("Developer disk image mounted.")
-        return true
+        // `variants` is never empty, so the loop failed at least once here.
+        throw firstFailure ?? CancellationError()
     }
 
     /// Push a coordinate to the device. The caller repeats this on a timer —
@@ -4222,19 +4309,6 @@ final class Engine {
 
 /// Computed so text is localized when read and follows language changes.
 enum Guides {
-    /// Shown only for a run that has to pair, the one step needing Wi-Fi.
-    static var wifi: Guide {
-        Guide(
-            title: L("Connect to Wi-Fi"),
-            systemImage: "wifi",
-            steps: [
-                L("Open Settings › Wi-Fi and join a network."),
-                L("Pairing this iPhone needs it: SideInstaller advertises itself on the local network for Settings to find."),
-                L("Then come back here — this continues automatically."),
-            ],
-            actionLabel: nil, actionURLString: nil)
-    }
-
     /// Shown when no tunnel is up. Recommends LocalDevVPN, but any VPN on the
     /// device subnet works.
     static var vpn: Guide {
@@ -4245,7 +4319,7 @@ enum Guides {
                 L("Install LocalDevVPN from the App Store and open it."),
                 L("If GitHub is blocked where you are, use a VPN that can proxy your traffic too: iOS runs one VPN at a time, so a local-only tunnel leaves nothing to download SideStore through."),
                 L("Tap Connect so the toggle turns on."),
-                L("Keep Wi-Fi on, then come back here — this continues automatically."),
+                L("Then come back here — this continues automatically."),
             ],
             actionLabel: L("Get LocalDevVPN"),
             actionURLString: "https://apps.apple.com/app/id6755608044")

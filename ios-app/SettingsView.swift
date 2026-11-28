@@ -320,8 +320,13 @@ struct SettingsView: View {
         developerModeNote = nil
         Task {
             do {
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
                 let text: String
-                switch try await engine.requestDeveloperMode(request) {
+                let outcome = try await MobileDataMode.shared.run(.developerMode) {
+                    try await engine.requestDeveloperMode(request)
+                }
+                switch outcome {
                 case .alreadyOn:
                     text = L("Developer Mode is already on.")
                 case .revealed:
@@ -331,6 +336,8 @@ struct SettingsView: View {
                 }
                 developerModeNote = DeveloperModeNote(text: text, failed: false)
                 SoundEffects.play(.success)
+            } catch is CancellationError {
+                // Mobile Data Mode's popup was closed: nothing to report.
             } catch {
                 developerModeNote = DeveloperModeNote(
                     text: (error as? LocalizedError)?.errorDescription ?? String(describing: error),

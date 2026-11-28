@@ -5,8 +5,13 @@
 //! which carries everything to this iPhone. `siboot check` also says whether
 //! this Open Minis can pair the iPhone.
 //!
+//! SideInstaller is downloaded here, before the iPhone is dialed
+//! (download.rs): where GitHub is blocked, the VPN that reaches it is on until
+//! then, and LocalDevVPN only from then on. When nothing answers at the
+//! iPhone's address after that, siboot asks for LocalDevVPN and dials again.
+//!
 //! The iPhone's pairing service is nearly always on port 49152, but not
-//! always. When it isn't there, this step finds the port it's on ([`reach`]),
+//! always. When it isn't there, this step finds the port it's on ([`reach_from`]),
 //! and the later steps dial that one.
 
 use std::collections::VecDeque;
@@ -22,8 +27,9 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::bridge::{Bridge, BridgeError};
+use crate::download::{self, Ipa};
 use crate::fail::{chain, Fail, Result};
-use crate::{ui, Args, Command};
+use crate::{mobile, ui, Args, Command};
 
 /// Open Minis in the App Store app, for the page's button. The page hands
 /// links that aren't http to iOS, so this opens the App Store itself.
@@ -41,7 +47,20 @@ pub struct Checked {
     /// Where the iPhone's pairing service answered: the address siboot was
     /// given, or the port the service turned out to be on.
     pub device: SocketAddr,
+    /// With the internet checked: the IPA. A full run has it here for step 5;
+    /// `siboot check` only looked.
+    pub ipa: Option<Ipa>,
 }
+
+/// Asked for when nothing answers at the iPhone's address once SideInstaller
+/// is here: no VPN carries it, or one that isn't LocalDevVPN, like one that
+/// reaches GitHub where it's blocked.
+const SWITCH_TITLE: &str = "Connect LocalDevVPN";
+const SWITCH_STEPS: [&str; 2] = [
+    "Open LocalDevVPN and connect it. iOS runs one VPN at a time, so it takes the place of any \
+     other: siboot has SideInstaller already, and doesn't need GitHub again.",
+    "Come back to Minis once LocalDevVPN shows Connected.",
+];
 
 pub async fn run(args: &Args) -> Result<Checked> {
     let in_minis = crate::web::available() || std::env::var_os("SIBOOT_MINIS_BIN").is_some();
@@ -53,17 +72,47 @@ pub async fn run(args: &Args) -> Result<Checked> {
     }
     // The tunnel stays on this iPhone; sign-in and the download don't.
     let online = args.command == Command::All || args.command == Command::Check;
-    if online {
-        check_online(args).await?;
-    }
+    let installs = args.command == Command::All;
+    let ipa = if online {
+        check_apple().await?;
+        let mode = if installs { download::Mode::Get } else { download::Mode::Look };
+        Some(download::get(args, mode).await?)
+    } else {
+        None
+    };
     ui::activity(&format!("reaching this iPhone at {}", args.device));
-    let (device, found) = reach(
+    let first = probe_with_vpn(
         args.device,
-        DYNAMIC_PORTS,
-        &KNOCKS,
         in_minis.then_some(&bridge),
+        installs && ui::interactive(),
     )
-    .await?;
+    .await;
+    let (device, found) = match reach_from(args.device, first, DYNAMIC_PORTS, &KNOCKS).await {
+        Ok(reached) => reached,
+        // Refused on every port while the internet works: what an iPhone on
+        // mobile data without Wi-Fi does, so Mobile Data Mode is offered
+        // (mobile.rs). `check` only says so.
+        Err(f) if f.refused
+            && args.command != Command::Check
+            && ui::interactive()
+            && (online || mobile::online().await) =>
+        {
+            if !mobile::offer(args.device) {
+                return Err(mobile::declined(f));
+            }
+            mobile::airplane_on(args.device, mobile::On::First).await?;
+            ui::activity(&format!("reaching this iPhone at {}", args.device));
+            reach_from(args.device, probe(args.device).await, DYNAMIC_PORTS, &KNOCKS)
+                .await
+                .map_err(mobile::not_mobile_data)?
+        }
+        Err(f) => {
+            return Err(match &ipa {
+                Some(ipa) if installs && ipa.github => with_kept_note(f, ipa),
+                _ => f,
+            })
+        }
+    };
     ui::ok(&format!(
         "this iPhone answers on {device} (RPPairing, wire protocol {})",
         found.wire_version
@@ -80,11 +129,25 @@ pub async fn run(args: &Args) -> Result<Checked> {
                 ui::warn("Minis's notifications are off, so the pairing code will show only in Minis.");
             }
             Err(why) => ui::warn(&format!(
-                "{why} The pairing then has to come from a file saved before, or from rootshell."
+                "{why} The pairing then has to come from a file saved before: {}",
+                crate::pairing::UPDATE_MINIS
             )),
         }
     }
-    Ok(Checked { online, device })
+    Ok(Checked { online, device, ipa })
+}
+
+/// A run that reached GitHub and stopped at the iPhone: SideInstaller is kept
+/// now, so the next one, with LocalDevVPN, needn't reach GitHub.
+fn with_kept_note(f: Fail, ipa: &Ipa) -> Fail {
+    Fail {
+        advice: format!(
+            "{} {} is downloaded and kept, so the next run doesn't need GitHub.",
+            f.advice,
+            ipa.name()
+        ),
+        ..f
+    }
 }
 
 /// Stop in an Open Minis older than 1.16. Minis doesn't tell the shell its
@@ -103,10 +166,10 @@ pub async fn check_minis(bridge: &Bridge) -> Result<()> {
     }
 }
 
-/// GitHub (the IPA) and Apple's sign-in server answer over TLS. Apple's
-/// `gsa.apple.com` chains to Apple Root CA, which Alpine's bundle lacks, so it's
-/// trusted here as isideload's GrandSlam client trusts it.
-async fn check_online(args: &Args) -> Result<()> {
+/// Apple's sign-in server answers over TLS. Its `gsa.apple.com` chains to
+/// Apple Root CA, which Alpine's bundle lacks, so it's trusted here as
+/// isideload's GrandSlam client trusts it. GitHub's turn is download.rs's.
+async fn check_apple() -> Result<()> {
     let apple_root = reqwest::Certificate::from_der(isideload::sideload::cert_identity::APPLE_ROOT)
         .map_err(|e| Fail::new("Couldn't load Apple's root certificate.", e.to_string()))?;
     let client = reqwest::Client::builder()
@@ -116,30 +179,6 @@ async fn check_online(args: &Args) -> Result<()> {
         .build()
         .map_err(|e| Fail::new("Couldn't start an HTTPS client.", e.to_string()))?;
 
-    let downloads = args
-        .ipa
-        .as_deref()
-        .is_none_or(|ipa| ipa.starts_with("http"));
-    if downloads {
-        let url = args.ipa.as_deref().unwrap_or(crate::sign::RELEASE_IPA);
-        ui::activity("reaching GitHub");
-        match client.head(url).send().await {
-            Ok(r) if r.status().is_success() => {
-                ui::ok("GitHub answers, and the SideInstaller release is there")
-            }
-            Ok(r) => ui::warn(&format!(
-                "GitHub answered {} for the SideInstaller release.",
-                r.status()
-            )),
-            Err(e) => {
-                return Err(Fail::new(
-                    "Couldn't reach GitHub, where SideInstaller is downloaded from. Check the \
-                     internet connection.",
-                    crate::error_text::error_text(&e),
-                ))
-            }
-        }
-    }
     // Any HTTP answer proves DNS, the route and the certificate chain.
     ui::activity("reaching Apple's sign-in server");
     match client
@@ -203,18 +242,15 @@ const LOCKDOWN_PORT: u16 = 62078;
 /// 10.7.0.1:49152. Minis's shell can't browse Bonjour for that advert, so
 /// siboot knocks on each port through LocalDevVPN instead. A closed port
 /// refuses at once, so it takes seconds; from a Mac over Wi-Fi, 9 s.
-async fn reach(
+///
+/// `first` is how the dial of `addr` went: step 1 may have asked for
+/// LocalDevVPN and dialed again in between.
+async fn reach_from(
     addr: SocketAddr,
+    first: std::result::Result<Found, Miss>,
     ports: impl IntoIterator<Item = u16>,
     knocks: &Knocks,
-    bridge: Option<&Bridge>,
 ) -> Result<(SocketAddr, Found)> {
-    let mut first = probe(addr).await;
-    if let (Err(Miss::Unreachable(why)), Some(bridge)) = (&first, bridge) {
-        if addr.ip() == IpAddr::V4(crate::DEFAULT_DEVICE_IP) {
-            first = recover_vpn(addr, bridge, &why.raw, VPN_WAIT, VPN_POLL).await;
-        }
-    }
     let missed = match first {
         Ok(found) => return Ok((addr, found)),
         Err(Miss::Unreachable(f)) => return Err(f),
@@ -237,6 +273,7 @@ async fn reach(
             Ok((moved, found))
         }
         Search::NotFound { open } => Err(Fail {
+            refused: missed.refused && open.is_empty(),
             raw: format!(
                 "{}; no other port answered as it ({count} knocked on in {took:.1} s; took the \
                  connection: {})",
@@ -247,6 +284,18 @@ async fn reach(
         }),
         Search::Stopped(f) => Err(f),
     }
+}
+
+/// `reach_from`, dialing `addr` first.
+#[cfg(test)]
+async fn reach(
+    addr: SocketAddr,
+    ports: impl IntoIterator<Item = u16>,
+    knocks: &Knocks,
+    bridge: Option<&Bridge>,
+) -> Result<(SocketAddr, Found)> {
+    let first = probe_with_vpn(addr, bridge, false).await;
+    reach_from(addr, first, ports, knocks).await
 }
 
 /// `ports` without the one already tried and lockdownd's, in order.
@@ -281,6 +330,34 @@ enum Miss {
 const ENABLE_VPN_URL: &str = "localdevvpn://enable?scheme=minis";
 const VPN_WAIT: Duration = Duration::from_secs(120);
 const VPN_POLL: Duration = Duration::from_millis(500);
+
+/// Get the route ready before the port search or the optional mobile-data
+/// flow. A missing VPN can be opened by Minis after the IPA is downloaded.
+async fn probe_with_vpn(
+    addr: SocketAddr,
+    bridge: Option<&Bridge>,
+    allow_manual: bool,
+) -> std::result::Result<Found, Miss> {
+    let missed = match probe(addr).await {
+        Err(Miss::Unreachable(why)) => why,
+        outcome => return outcome,
+    };
+    if let Some(bridge) = bridge.filter(|_| addr.ip() == IpAddr::V4(crate::DEFAULT_DEVICE_IP)) {
+        return recover_vpn(addr, bridge, &missed.raw, VPN_WAIT, VPN_POLL).await;
+    }
+    if !allow_manual {
+        return Err(Miss::Unreachable(missed));
+    }
+    ui::detail(&format!("nothing answers at {addr}: {}", missed.raw));
+    ui::status("connect LocalDevVPN when you're ready");
+    if !ui::get_ready(SWITCH_TITLE, &SWITCH_STEPS, &[], "Continue") {
+        return Err(Miss::Unreachable(Fail::by_user(
+            "Stopped before LocalDevVPN was connected.",
+        )));
+    }
+    ui::activity(&format!("reaching this iPhone at {addr}"));
+    probe(addr).await
+}
 
 /// Only a missing local route reaches here. Opening an app isn't proof that
 /// its VPN connected, so resume after Minis is back and the device answers.
@@ -347,23 +424,25 @@ async fn probe(addr: SocketAddr) -> std::result::Result<Found, Miss> {
     let stream = match timeout(Duration::from_secs(8), TcpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => {
-            return Err(Miss::Elsewhere(Fail::new(
-                format!(
-                    "The iPhone refused the connection at {addr}, and no other port on it answers \
-                     as its pairing service. Turn on Developer Mode (Settings › Privacy & \
-                     Security › Developer Mode), and check Wi-Fi is on. If both are on, restart \
-                     the iPhone, connect LocalDevVPN again and run siboot again."
-                ),
-                format!("{e} ({:?})", e.kind()),
-            )))
+            return Err(Miss::Elsewhere(Fail {
+                refused: true,
+                ..Fail::new(
+                    format!(
+                        "The iPhone refused the connection at {addr}, and no other port on it \
+                         answers as its pairing service. On mobile data without Wi-Fi, iOS \
+                         refuses every port: `siboot` then offers Mobile Data Mode (beta). \
+                         Otherwise turn on Developer Mode (Settings › Privacy & Security › \
+                         Developer Mode), and if it's on, restart the iPhone, connect LocalDevVPN \
+                         again and run siboot again."
+                    ),
+                    format!("{e} ({:?})", e.kind()),
+                )
+            }))
         }
         Ok(Err(e)) => return Err(Miss::Unreachable(unreachable(addr, &e))),
         Err(_) => {
             return Err(Miss::Unreachable(Fail::new(
-                format!(
-                    "Nothing answered at {addr}. Connect LocalDevVPN (it shows Connected), and \
-                     check Wi-Fi is on."
-                ),
+                format!("Nothing answered at {addr}. Connect LocalDevVPN (it shows Connected)."),
                 "connect timed out after 8 s",
             )))
         }
@@ -571,7 +650,7 @@ fn unreachable(addr: SocketAddr, e: &std::io::Error) -> Fail {
             "iOS won't let Minis reach {addr}. Connect LocalDevVPN (it shows Connected) and use \
              its address, 10.7.0.1."
         ),
-        _ => format!("Couldn't reach {addr}. Connect LocalDevVPN, and check Wi-Fi is on."),
+        _ => format!("Couldn't reach {addr}. Connect LocalDevVPN (it shows Connected)."),
     };
     Fail::new(advice, format!("{e} ({:?})", e.kind()))
 }
@@ -843,6 +922,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_refused_ports_allow_the_optional_mobile_data_flow() {
+        let first = local(closed_port().await);
+        let failure = reach(first, [closed_port().await], &QUICK, None).await.unwrap_err();
+        assert!(failure.refused);
+    }
+
+    #[tokio::test]
     async fn a_refused_port_sends_siboot_looking_for_the_service() {
         let (first, closed) = (closed_port().await, closed_port().await);
         let (silent, other, service) =
@@ -885,6 +971,7 @@ mod tests {
         let (low, high) = (other.min(silent), other.max(silent));
         assert!(f.raw.contains("3 knocked on"), "{}", f.raw);
         assert!(f.raw.ends_with(&format!("took the connection: {low}, {high})")), "{}", f.raw);
+        assert!(!f.refused, "an open service rules out every port being refused");
         assert!(!f.known && !f.by_user);
     }
 

@@ -5,9 +5,6 @@
 //! an ordinary static aarch64 Linux binary built on the same vendored idevice
 //! and isideload as SideInstaller. It pairs this iPhone with itself too:
 //! Minis 1.16 advertises the pairing host for it (pairing.rs, bridge.rs).
-//! Where Minis can't, the pairing comes from rootshell, another App Store app,
-//! whose siboot-pair (../rootshell) hands the file over on the iPhone's
-//! loopback (see README.md).
 //!
 //! The steps:
 //! 1 check · 2 pairing · 3 connect · 4 Apple ID · 5 sign · 6 install · 7 hand over.
@@ -23,17 +20,23 @@
 //! In Open Minis the run shows as a page in Minis's browser, served on this
 //! iPhone's loopback, and asks its questions there (web.rs); `--terminal`
 //! keeps it in the terminal.
+//!
+//! On mobile data without Wi-Fi the iPhone refuses LocalDevVPN's
+//! connections: siboot then offers Mobile Data Mode (beta), which connects in
+//! Airplane Mode and signs with mobile data (mobile.rs).
 
 mod account;
 mod companion;
 mod bridge;
 mod devmode;
+mod download;
 mod fail;
 #[cfg(test)]
 mod fake_iphone;
 mod install;
 mod identity;
 mod keepalive;
+mod mobile;
 mod pairing;
 mod preflight;
 mod report;
@@ -292,10 +295,13 @@ Open Minis, with your own Apple Account.
       Show this message.
 
 {needs}
-  iOS 27 or later, Developer Mode on, Wi-Fi,
+  iOS 27 or later, Developer Mode on,
   LocalDevVPN (App Store) connected, and
   Open Minis 1.16 or later: siboot stops in
-  an older one.",
+  an older one. On mobile data without
+  Wi-Fi, siboot offers Mobile Data Mode
+  (beta): Airplane Mode while it connects to
+  the iPhone, mobile data to sign in.",
         name = head("siboot"),
         usage = head("USAGE"),
         commands = head("COMMANDS"),
@@ -400,9 +406,13 @@ fn main() -> ExitCode {
         }
     });
     let code = match outcome {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            runtime.block_on(mobile::wrap_up());
+            ExitCode::SUCCESS
+        }
         Err(f) => {
             ui::failure(&f.advice, &f.raw);
+            runtime.block_on(mobile::wrap_up());
             report::after_failure(&args, &f);
             ExitCode::FAILURE
         }
@@ -513,10 +523,14 @@ async fn pipeline(args: &Args) -> Result<()> {
     if devmode {
         ui::step(1, "Checking LocalDevVPN and this iPhone");
     } else {
-        ui::step(1, "Checking LocalDevVPN, this iPhone and the internet");
+        ui::step(1, "Checking the internet, LocalDevVPN and this iPhone");
     }
     let checked = preflight::run(args).await.map_err(note)?;
-    ui::done(if checked.online { "online, and the iPhone answers" } else { "the iPhone answers" });
+    ui::done(&match &checked.ipa {
+        Some(ipa) if args.command == Command::All => format!("{} · the iPhone answers", ipa.name()),
+        _ if checked.online => "online, and the iPhone answers".into(),
+        _ => "the iPhone answers".into(),
+    });
     if args.command == Command::Check {
         ui::finish("Ready", &["Run siboot to install SideInstaller."]);
         return Ok(());
@@ -527,13 +541,14 @@ async fn pipeline(args: &Args) -> Result<()> {
         device: checked.device,
         ..args.clone()
     };
+    // Got in step 1, before LocalDevVPN had to be the VPN that's on.
+    let ipa = checked.ipa;
 
     ui::step(2, "Pairing this iPhone with siboot");
     let pairing_path = args.pairing_path();
     let source = pairing::ensure(args, &pairing_path).await.map_err(note)?;
     ui::done(match source {
         pairing::Source::Saved => "the saved pairing still works",
-        pairing::Source::Rootshell => "taken from rootshell",
         pairing::Source::Minis => "paired here in Minis",
     });
 
@@ -556,23 +571,35 @@ async fn pipeline(args: &Args) -> Result<()> {
     }
     // The connection is closed here: iOS drops an idle tunnel during sign-in and
     // signing anyway, so a fresh one is opened to install (as Side by Side does).
-    drop(connection);
+    // In Mobile Data Mode a fresh one takes Airplane Mode again, so this one is
+    // kept, and tried first.
+    let kept = if mobile::is_on() {
+        Some(connection)
+    } else {
+        drop(connection);
+        None
+    };
 
     ui::step(4, "Signing in to your Apple Account");
+    mobile::require_internet(mobile::Need::SignIn).await?;
     let mut session = account::sign_in(args).await?;
     ui::done(&session.team);
 
     ui::step(5, "Signing SideInstaller for this iPhone");
+    mobile::require_internet(mobile::Need::Signing).await?;
     identity::prepare(args, &mut session).await?;
-    let ipa = sign::fetch_ipa(args).await?;
-    let signed = sign::sign(&mut session, &ipa, &device).await?;
+    let ipa = ipa.ok_or_else(|| Fail::new("siboot has no IPA to sign.", "step 1 got none"))?;
+    let signed = sign::sign(&mut session, &ipa.path, &device).await?;
     ui::done(&match &signed.version {
         Some(version) => format!("{} {version} signed", signed.name),
         None => format!("{} signed", signed.name),
     });
 
     ui::step(6, "Installing it");
-    let mut connection = tunnel::open(args.device, &pairing_path).await?;
+    let mut connection = match mobile::reuse(kept).await {
+        Some(kept) => kept,
+        None => tunnel::open(args.device, &pairing_path).await?,
+    };
     let uploaded = install::install(&mut connection, &signed.app_dir).await?;
     ui::ok(&format!("{} installed ({})", signed.name, signed.bundle_id));
     ui::done(&format!("installed · {uploaded}"));
@@ -640,22 +667,20 @@ async fn developer_mode(args: &Args, connection: &mut tunnel::Connection) -> Res
         }
         devmode::Outcome::TurningOn => {
             ui::done("set to turn on");
-            ui::finish(
-                "Developer Mode is turning on",
-                &["This iPhone restarts now, and Minis stops with it.", unlock],
-            );
+            let mut paragraphs = vec!["This iPhone restarts now, and Minis stops with it.", unlock];
+            paragraphs.extend(mobile::restart_note());
+            ui::finish("Developer Mode is turning on", &paragraphs);
         }
         devmode::Outcome::HungUp => {
             ui::done("the iPhone hung up, restarting");
-            ui::finish(
-                "This iPhone is restarting",
-                &[
-                    "It hung up right after the request, as it does when it restarts to turn \
-                     Developer Mode on.",
-                    unlock,
-                    "If it doesn't restart, run siboot developer-mode again.",
-                ],
-            );
+            let mut paragraphs = vec![
+                "It hung up right after the request, as it does when it restarts to turn \
+                 Developer Mode on.",
+                unlock,
+                "If it doesn't restart, run siboot developer-mode again.",
+            ];
+            paragraphs.extend(mobile::restart_note());
+            ui::finish("This iPhone is restarting", &paragraphs);
         }
     }
     Ok(())

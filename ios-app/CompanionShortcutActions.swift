@@ -193,11 +193,14 @@ enum CompanionShortcutActions {
     private static func installPairing() async throws -> [String: Any] {
         try Shortcuts.requireNoInstall()
         try await ensureTunnel()
-        let targets = try await Engine.shared.installedPairingTargets()
-        guard !targets.isEmpty else {
-            throw ShortcutError(L("Install an app like SideStore, StikDebug, or Feather first, then rescan."))
+        let targets = try await MobileDataMode.shared.run(.pairing) {
+            let targets = try await Engine.shared.installedPairingTargets()
+            guard !targets.isEmpty else {
+                throw ShortcutError(L("Install an app like SideStore, StikDebug, or Feather first, then rescan."))
+            }
+            try await Engine.shared.installPairing(intoAll: targets)
+            return targets
         }
-        try await Engine.shared.installPairing(intoAll: targets)
         let dialog = targets.count == 1 ? L("Pairing file installed into %@.", targets[0].name)
                                        : L("Pairing file installed into all %d apps.", targets.count)
         return answer(targets.map(\.name), dialog: dialog)
@@ -205,7 +208,10 @@ enum CompanionShortcutActions {
 
     private static func revealDeveloperMode() async throws -> [String: Any] {
         try await ensureTunnel()
-        switch try await Engine.shared.requestDeveloperMode(.reveal) {
+        let result = try await MobileDataMode.shared.run(.developerMode) {
+            try await Engine.shared.requestDeveloperMode(.reveal)
+        }
+        switch result {
         case .alreadyOn: return answer(dialog: L("Developer Mode is already on."))
         case .revealed, .enabling:
             return answer(dialog: L("Developer Mode now shows under Settings › Privacy & Security, near the bottom. Turn it on there, and iOS restarts to finish."))

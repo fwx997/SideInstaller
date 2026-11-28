@@ -3,7 +3,6 @@
 //!
 //! ```sh
 //! cargo run --example screens                  # an install, pairing in Minis
-//! cargo run --example screens -- rootshell     # taking rootshell's pairing
 //! cargo run --example screens -- stop          # one that stops at Connect
 //! cargo run --example screens -- old-minis     # in an Open Minis before 1.16
 //! cargo run --example screens -- teams         # an Apple Account on two teams
@@ -11,6 +10,9 @@
 //! cargo run --example screens -- saved run-out # whose saved sign-in has run out
 //! cargo run --example screens -- moved         # the pairing service on 55021
 //! cargo run --example screens -- nowhere       # and on no port at all
+//! cargo run --example screens -- mobile        # on mobile data: Mobile Data Mode (beta)
+//! cargo run --example screens -- vpn           # another VPN on, then LocalDevVPN
+//! cargo run --example screens -- blocked       # GitHub blocked, SideInstaller kept
 //! cargo run --example screens -- developer-mode
 //! cargo run --example screens -- --plain       # the same, as plain lines
 //! cargo run --example screens -- --web         # the same, as the page
@@ -23,7 +25,7 @@
 //! its address printed; it starts once a browser has the page open, and the
 //! questions are answered there. `--open` opens it with macOS's `open`.
 //!
-//! The codes it asks for are 481516 (transfer) and 123456 (Apple's). The
+//! The code it asks for is 123456 (Apple's). The
 //! pairing code it shows is 975 088.
 
 #![allow(dead_code)]
@@ -37,6 +39,7 @@ mod ui;
 #[path = "../src/web.rs"]
 mod web;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -67,8 +70,17 @@ fn main() {
         Port::Moved
     } else if has("nowhere") {
         Port::Nowhere
+    } else if has("mobile") {
+        Port::Mobile
     } else {
         Port::Usual
+    };
+    let github = if has("vpn") {
+        Github::OtherVpn
+    } else if has("blocked") {
+        Github::Blocked
+    } else {
+        Github::Answers
     };
     let remembered = match (has("saved"), has("run-out")) {
         (true, false) => Some(Remembered::Lasting),
@@ -78,7 +90,7 @@ fn main() {
     let code = if has("old-minis") {
         old_minis();
         1
-    } else if run(devmode, stop, has("rootshell"), has("teams"), port, remembered) {
+    } else if run(devmode, stop, has("teams"), port, github, remembered) {
         0
     } else {
         1
@@ -136,13 +148,147 @@ enum Port {
     Moved,
     /// Nothing answers as it on any port.
     Nowhere,
+    /// Every port refuses, as on mobile data without Wi-Fi: siboot offers
+    /// Mobile Data Mode (mobile.rs).
+    Mobile,
+}
+
+/// Mobile Data Mode is on for the rest of the run.
+static MOBILE: AtomicBool = AtomicBool::new(false);
+
+fn mobile() -> bool {
+    MOBILE.load(Ordering::Relaxed)
+}
+
+const CONTROL_CENTER: &str = "Open Control Center: swipe down from the top-right corner of the screen.";
+const COME_BACK: &str = "Come back to Minis. siboot carries on by itself.";
+
+/// The offer after every port refused with the internet up, then Airplane
+/// Mode, as mobile.rs asks for them.
+fn mobile_mode_on() -> bool {
+    ui::status("this iPhone refuses siboot: try Mobile Data Mode?");
+    if !ui::get_ready(
+        "Try Mobile Data Mode (beta)?",
+        &[],
+        &[
+            "This iPhone refused siboot at 10.7.0.1 and on every other port. If it's on mobile \
+             data, not Wi-Fi, that's why: iOS doesn't accept new connections from LocalDevVPN \
+             then.",
+            "Mobile Data Mode works around that with Airplane Mode: you turn it on while siboot \
+             connects to this iPhone, and off again when siboot needs the internet. siboot tells \
+             you when.",
+            "Wi-Fi is the stable way, and the safer one. To use it, turn on Wi-Fi and run siboot \
+             again.",
+        ],
+        "Try Mobile Data Mode",
+    ) {
+        ui::failure(
+            "Stopped, to use Wi-Fi instead: turn it on, then run siboot again. If this iPhone is \
+             on Wi-Fi already, turn on Developer Mode (Settings › Privacy & Security › Developer \
+             Mode), and if it's on, restart the iPhone, connect LocalDevVPN again and run siboot \
+             again.",
+            "",
+        );
+        return false;
+    }
+    MOBILE.store(true, Ordering::Relaxed);
+    ui::note("Mobile Data Mode (beta) is on for this run.");
+    ui::show_guide(
+        "Turn on Airplane Mode",
+        &[
+            CONTROL_CENTER,
+            "Tap Airplane Mode to turn it on. Leave Wi-Fi off and LocalDevVPN connected.",
+            COME_BACK,
+        ],
+        &[],
+    );
+    ui::status("waiting for Airplane Mode");
+    wait(4000);
+    ui::guide_gone();
+    ui::ok("Airplane Mode is on, and this iPhone takes the connection");
+    ui::activity("reaching this iPhone at 10.7.0.1:49152");
+    wait(400);
+    ui::ok("this iPhone answers on 10.7.0.1:49152 (RPPairing, wire protocol 26)");
+    true
+}
+
+/// Before what needs the internet, in Mobile Data Mode.
+fn airplane_off(sentence: &str) {
+    ui::show_guide(
+        "Turn off Airplane Mode",
+        &[
+            CONTROL_CENTER,
+            "Tap Airplane Mode to turn it off, so mobile data comes back. Leave LocalDevVPN \
+             connected.",
+            COME_BACK,
+        ],
+        &[sentence],
+    );
+    ui::status("waiting for the internet");
+    wait(4000);
+    ui::guide_gone();
+    ui::ok("Airplane Mode is off, and Apple's sign-in server answers");
+}
+
+/// How GitHub answers step 1 (download.rs, preflight.rs).
+#[derive(Clone, Copy, PartialEq)]
+enum Github {
+    /// Through LocalDevVPN, as it does where GitHub isn't blocked.
+    Answers,
+    /// Through another VPN, on to reach it where it's blocked: SideInstaller
+    /// downloads, nothing answers at 10.7.0.1, and siboot asks for LocalDevVPN.
+    OtherVpn,
+    /// Not at all, so siboot installs the SideInstaller an earlier run kept.
+    Blocked,
+}
+
+/// Step 1's download of SideInstaller, before the iPhone is dialed.
+fn get_sideinstaller(github: Github) {
+    ui::activity("asking GitHub for SideInstaller's latest release");
+    wait(600);
+    if github == Github::Blocked {
+        ui::warn(
+            "Couldn't reach GitHub, so siboot installs SideInstaller 2.1.1, downloaded on an \
+             earlier run.",
+        );
+        return;
+    }
+    ui::status("downloading SideInstaller 2.1.1");
+    let total: u64 = 10_958_767;
+    for i in 0..=50u64 {
+        ui::progress("downloaded", total * i / 50, total);
+        wait(45);
+    }
+    ui::progress_end();
+    ui::ok("downloaded SideInstaller 2.1.1 (10.5 MB)");
 }
 
 /// Step 1's dial of the pairing service, and the look through the iPhone's
 /// other ports that follows a refusal.
-fn reach(port: Port) -> bool {
+fn reach(port: Port, github: Github) -> bool {
     ui::activity("reaching this iPhone at 10.7.0.1:49152");
     wait(500);
+    if github == Github::OtherVpn {
+        wait(1500);
+        ui::detail("nothing answers at 10.7.0.1:49152: connect timed out after 8 s");
+        ui::status("connect LocalDevVPN when you're ready");
+        if !ui::get_ready(
+            "Connect LocalDevVPN",
+            &[
+                "Open LocalDevVPN and connect it. iOS runs one VPN at a time, so it takes the \
+                 place of any other: siboot has SideInstaller already, and doesn't need GitHub \
+                 again.",
+                "Come back to Minis once LocalDevVPN shows Connected.",
+            ],
+            &[],
+            "Continue",
+        ) {
+            ui::failure("Stopped before LocalDevVPN was connected.", "");
+            return false;
+        }
+        ui::activity("reaching this iPhone at 10.7.0.1:49152");
+        wait(500);
+    }
     if port == Port::Usual {
         ui::ok("this iPhone answers on 10.7.0.1:49152 (RPPairing, wire protocol 26)");
         return true;
@@ -159,6 +305,10 @@ fn reach(port: Port) -> bool {
         wait(40);
     }
     ui::progress_end();
+    if port == Port::Mobile {
+        ui::detail("no other port answered as it (16382 knocked on in 4.1 s; took the connection: 54666, 58772)");
+        return mobile_mode_on();
+    }
     if port == Port::Nowhere {
         ui::failure(
             "The iPhone refused the connection at 10.7.0.1:49152, and no other port on it answers \
@@ -178,9 +328,9 @@ fn reach(port: Port) -> bool {
 fn run(
     devmode: bool,
     stop: bool,
-    rootshell: bool,
     teams: bool,
     port: Port,
+    github: Github,
     remembered: Option<Remembered>,
 ) -> bool {
     let steps = [
@@ -194,36 +344,24 @@ fn run(
         ui::plan(&steps, 7);
     }
 
-    ui::step(1, "Checking LocalDevVPN, this iPhone and the internet");
-    for (what, took, answer) in [
-        (
-            "reaching GitHub",
-            700,
-            "GitHub answers, and the SideInstaller release is there",
-        ),
-        (
-            "reaching Apple's sign-in server",
-            600,
-            "Apple's sign-in server answers",
-        ),
-    ] {
-        ui::activity(what);
-        wait(took);
-        ui::ok(answer);
+    if devmode {
+        ui::step(1, "Checking LocalDevVPN and this iPhone");
+    } else {
+        ui::step(1, "Checking the internet, LocalDevVPN and this iPhone");
+        ui::activity("reaching Apple's sign-in server");
+        wait(600);
+        ui::ok("Apple's sign-in server answers");
+        get_sideinstaller(github);
     }
-    if !reach(port) {
+    if !reach(port, if devmode { Github::Answers } else { github }) {
         return false;
     }
-    ui::done("online, and the iPhone answers");
+    ui::done(if devmode { "the iPhone answers" } else { "SideInstaller 2.1.1 · the iPhone answers" });
 
     ui::step(2, "Pairing this iPhone with siboot");
     ui::activity("checking that Open Minis can pair this iPhone");
     wait(500);
-    if rootshell {
-        if !take_from_rootshell() {
-            return false;
-        }
-    } else if !pair_here() {
+    if !pair_here() {
         return false;
     }
     ui::step(3, "Connecting to this iPhone through LocalDevVPN");
@@ -280,6 +418,12 @@ fn run(
     }
 
     ui::step(4, "Signing in to your Apple Account");
+    if mobile() {
+        airplane_off(
+            "siboot signs in to your Apple Account next, which needs the internet. Its \
+             connection to this iPhone stays open meanwhile.",
+        );
+    }
     let picked = match remembered {
         Some(_) => saved_account(),
         None => ask_email().map(|_| Picked::Typed),
@@ -478,22 +622,19 @@ fn password_and_code() -> bool {
 /// Steps 5 to 7, signed by team `id`.
 fn sign_and_install(id: &str, kind: team::Kind, first: bool) -> bool {
     ui::step(5, "Signing SideInstaller for this iPhone");
-    ui::status("downloading SideInstaller");
-    let total: u64 = 24 * 1_048_576 + 400_000;
-    for i in 0..=60u64 {
-        ui::progress("downloaded", total * i / 60, total);
-        wait(45);
-    }
-    ui::progress_end();
-    ui::ok("downloaded SideInstaller (24.4 MB)");
     ui::status("signing; this takes a while here");
     wait(4200);
     ui::ok(&format!(
         "signed SideInstaller as com.frizzlem.sideinstaller.{id}"
     ));
-    ui::done("SideInstaller 1.7.0 signed");
+    ui::done("SideInstaller 2.1.1 signed");
 
     ui::step(6, "Installing it");
+    if mobile() {
+        ui::activity("checking that the tunnel kept from step 3 still answers");
+        wait(600);
+        ui::ok("the tunnel opened in Airplane Mode still answers, so siboot installs through it");
+    }
     let total: u64 = 51 * 1_048_576;
     ui::status("uploading 412 files (51.0 MB)");
     for i in 0..=80u64 {
@@ -544,8 +685,19 @@ fn pair_here() -> bool {
              notification too.",
             "Come back to Minis once Settings says it's paired.",
         ],
-        &["When you start, a player opens over Minis. It plays silence, which keeps Minis \
-           running while you're in Settings: leave it open. siboot closes it once you're back."],
+        &[
+            "When you start, a player opens over Minis. It plays silence, which keeps Minis \
+             running while you're in Settings: leave it open. siboot closes it once you're back.",
+            if mobile() {
+                "Mobile Data Mode: leave Airplane Mode on while you pair. siboot says when to turn \
+                 it off."
+            } else {
+                ""
+            },
+        ]
+        .into_iter()
+        .filter(|note| !note.is_empty())
+        .collect::<Vec<_>>(),
         "Start pairing",
     ) {
         ui::failure("Stopped before pairing.", "");
@@ -567,41 +719,5 @@ fn pair_here() -> bool {
     wait(700);
     ui::ok("this iPhone accepts the new pairing");
     ui::done("paired here in Minis");
-    true
-}
-
-/// Step 2 with siboot-pair offering its file from rootshell.
-fn take_from_rootshell() -> bool {
-    ui::ok("rootshell is offering its file");
-    let mut tries = 3;
-    loop {
-        let Some(code) = ui::ask_code(
-            "rootshell is offering its file",
-            "Code",
-            "type the transfer code it shows",
-            "Transfer code shown in rootshell: ",
-        ) else {
-            ui::failure("Stopped at the transfer code.", "");
-            return false;
-        };
-        ui::activity("sending the code to rootshell");
-        wait(400);
-        if code == "481516" {
-            break;
-        }
-        tries -= 1;
-        if tries == 0 {
-            ui::failure("The transfer code didn't match. Run siboot again and type the code rootshell shows.", "");
-            return false;
-        }
-        ui::warn(&format!(
-            "That isn't the code rootshell shows ({tries} more {}).",
-            if tries == 1 { "try" } else { "tries" }
-        ));
-    }
-    ui::ok("took the pairing file from rootshell (1184 bytes)");
-    ui::activity("checking it with this iPhone");
-    wait(700);
-    ui::done("taken from rootshell");
     true
 }

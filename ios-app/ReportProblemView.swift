@@ -176,7 +176,13 @@ struct ReportProblemView: View {
         crashLookError = nil
         defer { lookingForCrashes = false }
         do {
-            deviceCrashes = try await engine.deviceCrashLogs()
+            let companionLease = try CompanionOperationLease.acquire()
+            defer { companionLease.release() }
+            deviceCrashes = try await MobileDataMode.shared.run(.crashLogs) {
+                try await engine.deviceCrashLogs()
+            }
+        } catch is CancellationError {
+            // Mobile Data Mode's popup was closed: nothing to report.
         } catch {
             crashLookError = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         }

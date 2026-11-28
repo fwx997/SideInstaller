@@ -899,11 +899,13 @@ final class JITManager: ObservableObject {
     /// Which session's events count: one that ended may still have some on
     /// their way.
     private var sessionID: UUID?
+    /// Waiting for the session's tunnel (`waitUntilConnected`).
+    private var connectWaiters: [CheckedContinuation<Void, Never>] = []
     /// Silent audio, so SideInstaller isn't suspended while the app it opened
     /// is in front: a debugger that stops answering leaves the app frozen at
     /// its next request.
     private let keepAlive = KeepAlive()
-    /// Protects the device while a debugger is preparing or serving its app.
+    /// Protects a running debugger after its preparation task has returned.
     private var companionLease: CompanionOperationLease.Token?
     private var didAutoLoad = false
     private static let modesKey = "jitModes"
@@ -954,9 +956,14 @@ final class JITManager: ObservableObject {
             do {
                 let lease = try CompanionOperationLease.acquire()
                 defer { lease.release() }
-                if !quiet { try await ensurePairingFile() }
+                let read = { () async throws -> [[String: Any]] in
+                    if !quiet { try await self.ensurePairingFile() }
+                    return try await self.engine.installedAppPlists()
+                }
+                // Only what the user asked for offers Mobile Data Mode.
+                let plists = quiet ? try await MobileDataMode.quietly(read) : try await MobileDataMode.shared.run(.jit, read)
                 let own = (Engine.companionHostBundle ?? Bundle.main).bundleIdentifier
-                apps = try await engine.installedAppPlists()
+                apps = plists
                     .compactMap(JITApp.init(plist:))
                     // Debugging SideInstaller would stop SideInstaller.
                     .filter { $0.bundleID != own }
@@ -1009,22 +1016,38 @@ final class JITManager: ObservableObject {
         let jitProtocol = jitProtocol(for: app)
         engine.log("=== JIT: \(app.name) (\(app.bundleID), \(jitProtocol.logName)) ===")
         Task {
+            defer { startingBundleID = nil }
             do {
-                companionLease = try CompanionOperationLease.acquire()
-                try await getReady()
-                let deviceIP = engine.deviceHost
-                let pairingFilePath = engine.pairingFilePath ?? PairingController.pairingFilePath()
-                start(app, jitProtocol, deviceIP: deviceIP, pairingFilePath: pairingFilePath)
+                // An early session end releases its own token, while preparation
+                // and Mobile Data Mode still retain this independent reference.
+                let preparationLease = try CompanionOperationLease.acquire()
+                defer { preparationLease.release() }
+                try await MobileDataMode.shared.run(.jit) {
+                    try await getReady()
+                    // The session opens a tunnel of its own, which on mobile
+                    // data alone needs Airplane Mode.
+                    try await MobileDataMode.shared.prepareNewTunnel()
+                    let deviceIP = engine.deviceHost
+                    let pairingFilePath = engine.pairingFilePath ?? PairingController.pairingFilePath()
+                    companionLease = try CompanionOperationLease.acquire()
+                    start(app, jitProtocol, deviceIP: deviceIP, pairingFilePath: pairingFilePath)
+                    // Airplane Mode stays on until the session's tunnel is up.
+                    await waitUntilConnected()
+                }
             } catch is CancellationError {
-                engine.log("JIT: pairing stopped.")
+                engine.log("JIT: stopped before the session started.")
             } catch {
                 let message = Self.text(error)
                 lastError = message
                 engine.log("⛔️ JIT: \(message)")
             }
-            if status == nil { releaseCompanionLease() }
-            startingBundleID = nil
         }
+    }
+
+    /// Returns once the session has its tunnel, or has ended.
+    private func waitUntilConnected() async {
+        guard let status, status.phase == .connecting else { return }
+        await withCheckedContinuation { connectWaiters.append($0) }
     }
 
     /// Quits the app the session is attached to, which ends the session.
@@ -1038,19 +1061,17 @@ final class JITManager: ObservableObject {
         try requireDeveloperMode()
         try await ensurePairingFile()
         if !DeveloperDiskImage.isDownloaded {
+            try await MobileDataMode.shared.requireInternet(.diskImageDownload)
             try await DeveloperDiskImage.downloadMissing { _ in }
         }
         // Mount progress goes to the activity log only.
         var lastLogged = -1
-        try await engine.prepareDeveloperDiskImage(
-            imagePath: DeveloperDiskImage.imagePath,
-            trustcachePath: DeveloperDiskImage.trustcachePath,
-            manifestPath: DeveloperDiskImage.manifestPath) { fraction in
-                let step = Int(fraction * 4) * 25
-                guard step > lastLogged else { return }
-                lastLogged = step
-                Engine.shared.log("DDI mount: \(step)%")
-            }
+        try await engine.prepareDeveloperDiskImage { fraction in
+            let step = Int(fraction * 4) * 25
+            guard step > lastLogged else { return }
+            lastLogged = step
+            Engine.shared.log("DDI mount: \(step)%")
+        }
     }
 
     private func requireDeveloperMode() throws {
@@ -1098,6 +1119,13 @@ final class JITManager: ObservableObject {
     private func handle(_ event: JITSession.Event) {
         switch event {
         case .phase(let phase):
+            if phase != .connecting {
+                // Past the tunnel, one way or the other: Mobile Data Mode's
+                // popups needn't wait for it any more.
+                MobileDataMode.shared.dialEnded(opened: !phase.isEnded)
+                connectWaiters.forEach { $0.resume() }
+                connectWaiters.removeAll()
+            }
             if case .ended(let outcome) = phase {
                 end(outcome)
             } else {

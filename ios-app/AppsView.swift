@@ -422,6 +422,9 @@ final class SideloadedAppsManager: ObservableObject {
         guard !didAutoLoad, !hasLoaded, !isWorking else { return }
         engine.refreshNetworkStatus()
         guard engine.vpnConnected else { return }
+        // On mobile data alone reading the device needs Mobile Data Mode,
+        // which only asks when the user taps Load, unless its tunnel is open.
+        guard !NetworkStatus.links().mobileDataOnly || MobileDataMode.shared.mayHaveOpenTunnel else { return }
         didAutoLoad = true
         load(quiet: true)
     }
@@ -434,7 +437,17 @@ final class SideloadedAppsManager: ObservableObject {
         if !quiet { engine.log("=== Sideloaded apps: reading the device ===") }
         Task {
             do {
-                try await performLoad()
+                let companionLease = try CompanionOperationLease.acquire()
+                defer { companionLease.release() }
+                // Only what the user asked for offers Mobile Data Mode.
+                if quiet {
+                    // Even after a refresh, which is an action of its own.
+                    try await MobileDataMode.quietly { try await performLoad() }
+                } else {
+                    try await MobileDataMode.shared.run(.apps) { try await performLoad() }
+                }
+            } catch is CancellationError {
+                // Mobile Data Mode's popup was closed: nothing to report.
             } catch {
                 let message = Self.text(for: error)
                 if quiet {
@@ -451,8 +464,6 @@ final class SideloadedAppsManager: ObservableObject {
     /// Reads the device's apps and profiles and matches them. The caller holds
     /// `isWorking`.
     private func performLoad() async throws {
-        let companionLease = try CompanionOperationLease.acquire()
-        defer { companionLease.release() }
         let inventory = try await engine.sideloadedAppInventory()
         let apps = inventory.apps.compactMap(SideloadedApp.init(plist:))
         // TestFlight apps' profiles would otherwise show as unused.
@@ -499,9 +510,14 @@ final class SideloadedAppsManager: ObservableObject {
                 refreshStatus = nil
                 refreshTask = nil
             }
+            // The action and its cleanup both retain the shared device lease.
             do {
                 companionLease = try CompanionOperationLease.acquire()
-                try await engine.prepareRefresh()
+                return try await MobileDataMode.shared.run(.refresh) { try await performRefresh() }
+            } catch is CancellationError {
+                engine.log("Refresh all: stopped before it began.")
+                jobs = []
+                return RefreshOutcome(failure: L("Nothing was refreshed."))
             } catch {
                 let message = Self.text(for: error)
                 if showsFailure { lastError = message }
@@ -509,48 +525,51 @@ final class SideloadedAppsManager: ObservableObject {
                 jobs = []
                 return RefreshOutcome(failure: message)
             }
-
-            var refreshed = 0
-            for index in jobs.indices {
-                // Cancellation is checked between apps; signing and installing
-                // can't be interrupted midway.
-                if Task.isCancelled { break }
-                let job = jobs[index]
-                // Skip apps signed by a different team: the new bundle ID would
-                // install a second copy instead of replacing the app.
-                if let team = engine.signingTeamID, let installed = job.teamID, installed != team {
-                    jobs[index].state = .failed(
-                        L("Signed by team %@, not the one you're signed in as — refreshing it here would install a second copy.", installed))
-                    continue
-                }
-                jobs[index].state = .working
-                refreshStatus = L("Refreshing %@", job.name)
-                do {
-                    try await engine.refreshInstalledApp(named: job.name, ipaPath: job.ipa.path)
-                    jobs[index].state = .done
-                    refreshed += 1
-                } catch {
-                    let message = Self.text(for: error)
-                    jobs[index].state = .failed(message)
-                    engine.log("⛔️ Refresh \(job.name): \(message)")
-                }
-            }
-
-            refreshSummary = jobs.count == 1
-                ? (refreshed == 1 ? L("Refreshed. Its seven days start again now.")
-                                  : L("Nothing was refreshed."))
-                : L("Refreshed %d of %d apps.", refreshed, jobs.count)
-            engine.log("Refresh all finished: \(refreshed)/\(jobs.count) refreshed.")
-            let outcome = RefreshOutcome(jobs: jobs)
-            // Read the device again, so the days on screen are the new ones.
-            if refreshed > 0 {
-                isRefreshing = false        // `load` won't run while a refresh holds the link
-                load(quiet: true)
-            }
-            return outcome
         }
         refreshTask = task
         return task
+    }
+
+    private func performRefresh() async throws -> RefreshOutcome {
+        try await engine.prepareRefresh()
+        var refreshed = 0
+        for index in jobs.indices {
+            // Cancellation is checked between apps; signing and installing
+            // can't be interrupted midway.
+            if Task.isCancelled { break }
+            let job = jobs[index]
+            // Skip apps signed by a different team: the new bundle ID would
+            // install a second copy instead of replacing the app.
+            if let team = engine.signingTeamID, let installed = job.teamID, installed != team {
+                jobs[index].state = .failed(
+                    L("Signed by team %@, not the one you're signed in as — refreshing it here would install a second copy.", installed))
+                continue
+            }
+            jobs[index].state = .working
+            refreshStatus = L("Refreshing %@", job.name)
+            do {
+                try await engine.refreshInstalledApp(named: job.name, ipaPath: job.ipa.path)
+                jobs[index].state = .done
+                refreshed += 1
+            } catch {
+                let message = Self.text(for: error)
+                jobs[index].state = .failed(message)
+                engine.log("⛔️ Refresh \(job.name): \(message)")
+            }
+        }
+
+        refreshSummary = jobs.count == 1
+            ? (refreshed == 1 ? L("Refreshed. Its seven days start again now.")
+                              : L("Nothing was refreshed."))
+            : L("Refreshed %d of %d apps.", refreshed, jobs.count)
+        engine.log("Refresh all finished: \(refreshed)/\(jobs.count) refreshed.")
+        let outcome = RefreshOutcome(jobs: jobs)
+        // Read the device again, so the days on screen are the new ones.
+        if refreshed > 0 {
+            isRefreshing = false        // `load` won't run while a refresh holds the link
+            load(quiet: true)
+        }
+        return outcome
     }
 
     // MARK: - Shortcuts
@@ -562,7 +581,9 @@ final class SideloadedAppsManager: ObservableObject {
         isWorking = true
         defer { isWorking = false }
         lastError = nil
-        try await performLoad()
+        let companionLease = try CompanionOperationLease.acquire()
+        defer { companionLease.release() }
+        try await MobileDataMode.shared.run(.apps) { try await performLoad() }
     }
 
     /// Reads the device afresh, then refreshes the refreshable apps whose
