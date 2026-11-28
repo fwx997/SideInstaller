@@ -9,7 +9,11 @@ Open Minis 1.16 (App Store, 2026-11-14) siboot pairs the iPhone with itself too
 ## Running it
 
 Needs iOS 27 or later, Developer Mode on, Wi-Fi, LocalDevVPN (App Store)
-connected, and Open Minis 1.16 or later. Then, in Open Minis's terminal:
+installed, and Open Minis 1.16 or later. If its local connection is unavailable,
+siboot opens LocalDevVPN to enable it and return to Minis. Allow the VPN prompt
+when shown and keep the device unlocked. siboot waits up to two minutes for
+Minis to return to the foreground and the device to answer before continuing.
+Then, in Open Minis's terminal:
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/FrizzleM/siboot/main/minis/install.sh | sh

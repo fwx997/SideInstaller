@@ -240,6 +240,15 @@ impl Bridge {
         })
     }
 
+    /// Require an explicit lifecycle value before resuming a handoff.
+    pub async fn is_foreground(&self) -> Result<bool, BridgeError> {
+        let data = self.call("minis-bonjour", &["list"]).await?;
+        data.get("app_in_background")
+            .and_then(Value::as_bool)
+            .map(|background| !background)
+            .ok_or_else(|| BridgeError::Unreadable("minis-bonjour omitted app_in_background".into()))
+    }
+
     /// Publish `service_type` as `name`, forwarding to `port` inside the shell.
     /// The returned guard withdraws it when dropped.
     pub async fn advertise(
@@ -278,6 +287,17 @@ impl Bridge {
 
     pub async fn stop_advert(&self, id: &str) -> Result<(), BridgeError> {
         self.call("minis-bonjour", &["stop", id]).await.map(|_| ())
+    }
+
+    // MARK: apple-open
+
+    /// The native UIApplication completion result. `ok: true` alone only
+    /// means that apple-open ran, even when iOS refused the URL.
+    pub async fn open_url(&self, url: &str) -> Result<bool, BridgeError> {
+        let data = self.call("apple-open", &[url]).await?;
+        data.get("opened")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| BridgeError::Unreadable("apple-open omitted opened".into()))
     }
 
     // MARK: apple-notification

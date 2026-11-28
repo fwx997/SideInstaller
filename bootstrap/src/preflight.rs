@@ -45,9 +45,10 @@ pub struct Checked {
 
 pub async fn run(args: &Args) -> Result<Checked> {
     let in_minis = crate::web::available() || std::env::var_os("SIBOOT_MINIS_BIN").is_some();
+    let bridge = Bridge::from_env();
     if in_minis {
         ui::activity("checking this Open Minis");
-        check_minis(&Bridge::from_env()).await?;
+        check_minis(&bridge).await?;
         ui::ok("this Open Minis is 1.16 or later");
     }
     // The tunnel stays on this iPhone; sign-in and the download don't.
@@ -56,7 +57,13 @@ pub async fn run(args: &Args) -> Result<Checked> {
         check_online(args).await?;
     }
     ui::activity(&format!("reaching this iPhone at {}", args.device));
-    let (device, found) = reach(args.device, DYNAMIC_PORTS, &KNOCKS).await?;
+    let (device, found) = reach(
+        args.device,
+        DYNAMIC_PORTS,
+        &KNOCKS,
+        in_minis.then_some(&bridge),
+    )
+    .await?;
     ui::ok(&format!(
         "this iPhone answers on {device} (RPPairing, wire protocol {})",
         found.wire_version
@@ -200,8 +207,15 @@ async fn reach(
     addr: SocketAddr,
     ports: impl IntoIterator<Item = u16>,
     knocks: &Knocks,
+    bridge: Option<&Bridge>,
 ) -> Result<(SocketAddr, Found)> {
-    let missed = match probe(addr).await {
+    let mut first = probe(addr).await;
+    if let (Err(Miss::Unreachable(why)), Some(bridge)) = (&first, bridge) {
+        if addr.ip() == IpAddr::V4(crate::DEFAULT_DEVICE_IP) {
+            first = recover_vpn(addr, bridge, &why.raw, VPN_WAIT, VPN_POLL).await;
+        }
+    }
+    let missed = match first {
         Ok(found) => return Ok((addr, found)),
         Err(Miss::Unreachable(f)) => return Err(f),
         Err(Miss::Elsewhere(f)) => f,
@@ -253,6 +267,7 @@ fn listed(ports: &[u16]) -> String {
 }
 
 /// Why the pairing service didn't answer at an address.
+#[derive(Debug)]
 enum Miss {
     /// LocalDevVPN carried the connection, but the service isn't there: the
     /// port refused, or something else took it. It can be on another port.
@@ -260,6 +275,69 @@ enum Miss {
     Elsewhere(Fail),
     /// Nothing gets through to the iPhone.
     Unreachable(Fail),
+}
+
+// Open Minis registers `minis`. LocalDevVPN adds :// to this callback scheme.
+const ENABLE_VPN_URL: &str = "localdevvpn://enable?scheme=minis";
+const VPN_WAIT: Duration = Duration::from_secs(120);
+const VPN_POLL: Duration = Duration::from_millis(500);
+
+/// Only a missing local route reaches here. Opening an app isn't proof that
+/// its VPN connected, so resume after Minis is back and the device answers.
+async fn recover_vpn(
+    addr: SocketAddr,
+    bridge: &Bridge,
+    first_error: &str,
+    wait: Duration,
+    poll: Duration,
+) -> std::result::Result<Found, Miss> {
+    ui::status("opening LocalDevVPN to connect this iPhone");
+    ui::note(
+        "Allow LocalDevVPN to connect, then return to Open Minis. siboot will continue \
+         when the connection is ready.",
+    );
+    let failure = match bridge.open_url(ENABLE_VPN_URL).await {
+        Ok(true) => None,
+        Ok(false) => Some("iOS did not open LocalDevVPN".to_string()),
+        Err(error) => Some(error.to_string()),
+    };
+    if let Some(detail) = failure {
+        ui::link("Open LocalDevVPN", ENABLE_VPN_URL);
+        return Err(Miss::Unreachable(Fail::new(
+            "Couldn't open LocalDevVPN. Unlock this iPhone, open LocalDevVPN and connect it, \
+             then return to Open Minis and run siboot again. Check that LocalDevVPN is installed.",
+            format!("{first_error}; {detail}"),
+        )));
+    }
+    ui::status("waiting for LocalDevVPN and your return to Open Minis");
+    let mut last_error = first_error.to_string();
+    match timeout(wait, wait_for_vpn(addr, bridge, poll, &mut last_error)).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(Miss::Unreachable(Fail::new(
+            "The connection still isn't ready. Unlock this iPhone, check that LocalDevVPN \
+             shows Connected and Wi-Fi is on, then return to Open Minis and run siboot again.",
+            format!("VPN recovery timed out after {} s; {last_error}", wait.as_secs()),
+        ))),
+    }
+}
+
+async fn wait_for_vpn(
+    addr: SocketAddr,
+    bridge: &Bridge,
+    poll: Duration,
+    last_error: &mut String,
+) -> std::result::Result<Found, Miss> {
+    loop {
+        match bridge.is_foreground().await {
+            Ok(true) => match probe(addr).await {
+                Err(Miss::Unreachable(why)) => *last_error = why.raw,
+                outcome => return outcome,
+            },
+            Err(error) => *last_error = error.to_string(),
+            Ok(false) => {}
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 /// Ask the iPhone's RPPairing listener for its handshake, as the first message
@@ -604,6 +682,166 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
+    fn vpn_stub() -> (std::path::PathBuf, Bridge) {
+        let home = std::env::temp_dir().join(format!("siboot-vpn-{}", uuid::Uuid::new_v4()));
+        let bridge = Bridge::in_dir(fake_iphone::minis_stub(&home));
+        (home, bridge)
+    }
+
+    async fn wait_for_background_check(home: &std::path::Path) {
+        for _ in 0..200 {
+            let calls = std::fs::read_to_string(home.join("minis-calls.log")).unwrap_or_default();
+            if calls.contains("minis-bonjour list --compact") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("recovery never checked Minis's foreground state");
+    }
+
+    #[tokio::test]
+    async fn opening_vpn_requires_the_native_opened_result() {
+        let (home, bridge) = vpn_stub();
+        std::fs::write(home.join("minis-open-denied"), b"").unwrap();
+        let result = recover_vpn(local(1), &bridge, "no route", VPN_WAIT, VPN_POLL).await;
+        let Err(Miss::Unreachable(why)) = result else {
+            panic!("{result:?}")
+        };
+        assert!(why.advice.contains("Couldn't open LocalDevVPN"));
+        assert!(why.raw.contains("iOS did not open LocalDevVPN"));
+        let calls = std::fs::read_to_string(home.join("minis-calls.log")).unwrap();
+        assert_eq!(calls, format!("apple-open {ENABLE_VPN_URL} --compact\n"));
+    }
+
+    #[tokio::test]
+    async fn missing_or_unreadable_open_bridge_has_manual_recovery() {
+        let (home, bridge) = vpn_stub();
+        std::fs::write(home.join("minis-open-malformed"), b"").unwrap();
+        let result = recover_vpn(local(1), &bridge, "no route", VPN_WAIT, VPN_POLL).await;
+        let Err(Miss::Unreachable(why)) = result else {
+            panic!("{result:?}")
+        };
+        assert!(why.raw.contains("omitted opened"));
+        std::fs::remove_file(home.join("stub-bin/apple-open")).unwrap();
+        let result = recover_vpn(local(1), &bridge, "no route", VPN_WAIT, VPN_POLL).await;
+        let Err(Miss::Unreachable(why)) = result else {
+            panic!("{result:?}")
+        };
+        assert!(why.advice.contains("Unlock this iPhone"));
+        assert!(why.advice.contains("run siboot again"));
+    }
+
+    #[tokio::test]
+    async fn vpn_recovery_waits_for_minis_and_a_real_pairing_answer() {
+        let (home, bridge) = vpn_stub();
+        let background = home.join("minis-background");
+        std::fs::write(&background, b"").unwrap();
+        let addr = local(pairing_service().await);
+        let work = tokio::spawn(async move {
+            recover_vpn(
+                addr,
+                &bridge,
+                "no route",
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+            )
+            .await
+        });
+        wait_for_background_check(&home).await;
+        assert!(
+            !work.is_finished(),
+            "a live tunnel alone cannot resume while Minis is behind VPN"
+        );
+        std::fs::remove_file(background).unwrap();
+        let found = work.await.unwrap().unwrap();
+        assert_eq!(found.name.as_deref(), Some("Test iPhone"));
+        let calls = std::fs::read_to_string(home.join("minis-calls.log")).unwrap();
+        let opened = calls.lines().filter(|line| line.starts_with("apple-open ")).count();
+        assert_eq!(opened, 1);
+    }
+
+    #[tokio::test]
+    async fn recovered_route_still_requires_the_pairing_service() {
+        let (_home, bridge) = vpn_stub();
+        let result = recover_vpn(
+            local(closed_port().await), &bridge, "no route", VPN_WAIT, VPN_POLL,
+        )
+        .await;
+        assert!(matches!(result, Err(Miss::Elsewhere(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_successful_open_can_still_time_out() {
+        let (home, bridge) = vpn_stub();
+        std::fs::write(home.join("minis-background"), b"").unwrap();
+        let result = recover_vpn(
+            local(1),
+            &bridge,
+            "no route",
+            Duration::from_millis(60),
+            Duration::from_millis(10),
+        )
+        .await;
+        let Err(Miss::Unreachable(why)) = result else {
+            panic!("{result:?}")
+        };
+        assert!(why.advice.contains("still isn't ready"));
+        assert!(why.raw.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_foreground_state_cannot_resume_the_install() {
+        let (home, bridge) = vpn_stub();
+        std::fs::write(
+            home.join("stub-bin/minis-bonjour"),
+            b"#!/bin/sh\necho '{\"ok\":true,\"data\":{}}'\n",
+        )
+        .unwrap();
+        let result = recover_vpn(
+            local(pairing_service().await),
+            &bridge,
+            "no route",
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        )
+        .await;
+        let Err(Miss::Unreachable(why)) = result else {
+            panic!("{result:?}")
+        };
+        assert!(why.raw.contains("omitted app_in_background"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_vpn_recovery_stops_its_bridge_calls() {
+        let (home, bridge) = vpn_stub();
+        std::fs::write(home.join("minis-background"), b"").unwrap();
+        let work = tokio::spawn(async move {
+            recover_vpn(
+                local(1), &bridge, "no route", VPN_WAIT, Duration::from_secs(60),
+            )
+            .await
+        });
+        wait_for_background_check(&home).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        work.abort();
+        assert!(work.await.unwrap_err().is_cancelled());
+        let log = home.join("minis-calls.log");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(std::fs::read_to_string(log).unwrap(), calls);
+    }
+
+    #[tokio::test]
+    async fn a_working_route_does_not_open_the_vpn_app() {
+        let (home, bridge) = vpn_stub();
+        let service = pairing_service().await;
+        let (at, _) = reach(local(service), [], &QUICK, Some(&bridge)).await.unwrap();
+        assert_eq!(at, local(service));
+        let failed = reach(local(closed_port().await), [], &QUICK, Some(&bridge)).await;
+        assert!(failed.is_err());
+        assert!(!home.join("minis-calls.log").exists());
+    }
+
     #[tokio::test]
     async fn a_refused_port_sends_siboot_looking_for_the_service() {
         let (first, closed) = (closed_port().await, closed_port().await);
@@ -612,7 +850,7 @@ mod tests {
         let mut ports = vec![closed; 200];
         ports.extend([silent, other, closed, service]);
 
-        let (at, found) = reach(local(first), ports, &QUICK).await.unwrap();
+        let (at, found) = reach(local(first), ports, &QUICK, None).await.unwrap();
         assert_eq!(at, local(service));
         assert_eq!(found.wire_version, 26);
         assert_eq!(found.name.as_deref(), Some("Test iPhone"));
@@ -621,7 +859,7 @@ mod tests {
     #[tokio::test]
     async fn so_does_something_else_on_that_port() {
         let (other, service) = (other_service().await, pairing_service().await);
-        let (at, _) = reach(local(other), [other, service], &QUICK).await.unwrap();
+        let (at, _) = reach(local(other), [other, service], &QUICK, None).await.unwrap();
         assert_eq!(at, local(service));
     }
 
@@ -629,7 +867,7 @@ mod tests {
     async fn the_service_where_it_should_be_is_taken_without_looking() {
         let service = pairing_service().await;
         // Nothing to look through: the first answer is the one used.
-        let (at, found) = reach(local(service), std::iter::empty(), &QUICK).await.unwrap();
+        let (at, found) = reach(local(service), std::iter::empty(), &QUICK, None).await.unwrap();
         assert_eq!((at, found.wire_version), (local(service), 26));
     }
 
@@ -638,7 +876,7 @@ mod tests {
         let first = closed_port().await;
         let (silent, other, closed) =
             (silent_service().await, other_service().await, closed_port().await);
-        let f = reach(local(first), [closed, other, silent], &QUICK).await.unwrap_err();
+        let f = reach(local(first), [closed, other, silent], &QUICK, None).await.unwrap_err();
         assert!(f.advice.starts_with(&format!(
             "The iPhone refused the connection at 127.0.0.1:{first}, and no other port"
         )));
@@ -653,7 +891,7 @@ mod tests {
     #[tokio::test]
     async fn ports_that_all_take_the_connection_are_not_this_iphones() {
         let (first, other) = (closed_port().await, other_service().await);
-        let f = reach(local(first), vec![other; MOST_OPEN + 5], &QUICK)
+        let f = reach(local(first), vec![other; MOST_OPEN + 5], &QUICK, None)
             .await
             .unwrap_err();
         assert!(f.advice.contains("another VPN or a proxy"), "{}", f.advice);

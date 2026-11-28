@@ -352,7 +352,8 @@ fn opack_dict(entries: &[(&str, Opack)]) -> Vec<u8> {
 /// it before Local Network access is allowed (and the file goes); with
 /// `<home>/minis-undeclared`, this Minis doesn't declare the pairing type;
 /// with `<home>/minis-player-closed`, the player's sheet was closed, until
-/// the next `play`.
+/// the next `play`. `minis-open-denied` makes iOS refuse opening a URL, and
+/// `minis-open-malformed` omits the native completion result.
 pub fn minis_stub(home: &Path) -> PathBuf {
     let dir = home.join("stub-bin");
     std::fs::create_dir_all(&dir).unwrap();
@@ -368,7 +369,20 @@ pub fn minis_stub(home: &Path) -> PathBuf {
     let leftover = leftover.to_string_lossy();
     let closed = home.join("minis-player-closed");
     let closed = closed.to_string_lossy();
+    let open_denied = home.join("minis-open-denied");
+    let open_denied = open_denied.to_string_lossy();
+    let open_malformed = home.join("minis-open-malformed");
+    let open_malformed = open_malformed.to_string_lossy();
     let scripts = [
+        (
+            "apple-open",
+            r#"if [ -e "$OPEN_MALFORMED" ]; then
+  echo '{"ok":true,"tool":"apple-open","action":"open","data":{}}'
+else
+  if [ -e "$OPEN_DENIED" ]; then opened=false; else opened=true; fi
+  echo '{"ok":true,"tool":"apple-open","action":"open","data":{"opened":'$opened'}}'
+fi"#,
+        ),
         (
             "minis-bonjour",
             r#"case "$1" in
@@ -417,6 +431,7 @@ esac"#,
             format!(
                 "#!/bin/sh\nBACKGROUND='{background}'\nDENY='{deny}'\nUNDECLARED='{undeclared}'\n\
                  LEFTOVER='{leftover}'\nPLAYER_CLOSED='{closed}'\n\
+                 OPEN_DENIED='{open_denied}'\nOPEN_MALFORMED='{open_malformed}'\n\
                  echo \"{name} $*\" >> '{log}'\n{body}\n"
             ),
         )
